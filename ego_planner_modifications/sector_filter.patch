@@ -1,0 +1,3218 @@
+diff --git a/src/planner/plan_env/CMakeLists.txt b/src/planner/plan_env/CMakeLists.txt
+index d44d0b4..4778873 100755
+--- a/src/planner/plan_env/CMakeLists.txt
++++ b/src/planner/plan_env/CMakeLists.txt
+@@ -28,6 +28,12 @@ find_package(Eigen3 REQUIRED)
+ find_package(PCL REQUIRED)
+ find_package(pcl_conversions REQUIRED)
+ 
++find_package(tf2_ros REQUIRED)
++find_package(tf2_sensor_msgs REQUIRED)
++find_package(tf2 REQUIRED)
++find_package(sensor_msgs REQUIRED)
++find_package(tf2_geometry_msgs REQUIRED)
++
+ if(BUILD_TESTING)
+   find_package(ament_lint_auto REQUIRED)
+   # the following line skips the linter which checks for copyrights
+@@ -58,7 +64,23 @@ add_library( plan_env SHARED
+     src/obj_predictor.cpp 
+     )
+ 
+-ament_target_dependencies(plan_env std_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
++ament_export_dependencies(
++  rclcpp
++  std_msgs visualization_msgs geometry_msgs nav_msgs sensor_msgs
++  Eigen3 PCL
++  cv_bridge message_filters pcl_conversions
++  tf2 tf2_ros tf2_sensor_msgs
++  tf2_geometry_msgs
++)  
++
++ament_target_dependencies(plan_env
++  rclcpp
++  std_msgs visualization_msgs geometry_msgs nav_msgs sensor_msgs
++  Eigen3 PCL
++  cv_bridge message_filters pcl_conversions
++  tf2 tf2_ros tf2_sensor_msgs
++  tf2_geometry_msgs
++)
+ 
+ target_link_libraries( plan_env 
+   ${PCL_LIBRARIES}
+@@ -68,7 +90,11 @@ target_link_libraries( plan_env
+ add_executable(obj_generator
+     src/obj_generator.cpp 
+ )
+-ament_target_dependencies(obj_generator std_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
++ament_target_dependencies(obj_generator
++  rclcpp
++  std_msgs visualization_msgs geometry_msgs nav_msgs sensor_msgs
++  Eigen3 PCL cv_bridge message_filters pcl_conversions
++)
+ 
+ install(TARGETS plan_env
+         DESTINATION lib
+@@ -85,3 +111,4 @@ install(DIRECTORY include/${PROJECT_NAME}/
+ ament_export_libraries(plan_env)
+ 
+ ament_package()
++
+diff --git a/src/planner/plan_env/include/plan_env/grid_map.h b/src/planner/plan_env/include/plan_env/grid_map.h
+index cd238a4..8232592 100755
+--- a/src/planner/plan_env/include/plan_env/grid_map.h
++++ b/src/planner/plan_env/include/plan_env/grid_map.h
+@@ -1,6 +1,7 @@
+ #ifndef _GRID_MAP_H
+ #define _GRID_MAP_H
+ 
++#include <atomic>
+ #include <Eigen/Eigen>
+ #include <Eigen/StdVector>
+ #include <cv_bridge/cv_bridge.h>
+@@ -24,19 +25,37 @@
+ 
+ #include <plan_env/raycast.h>
+ 
+-#define logit(x) (log((x) / (1 - (x))))
++#include <tf2_ros/transform_listener.h>
++#include <tf2_ros/buffer.h>
++
++#include <sensor_msgs/msg/image.hpp>
++#include <sensor_msgs/msg/point_cloud2.hpp>
++#include <std_msgs/msg/bool.hpp>
++#include <std_msgs/msg/empty.hpp>
++
++#include <functional>
++#include <cmath>
++#include <cstdint>
++
++#include <algorithm>
++#include <string>
++#include <vector>
++#include <memory>
++
++#include <opencv2/core.hpp>
++#include <deque>
++
++#define logit(x) (std::log((x) / (1 - (x))))
++
++
+ 
+-using namespace std;
+ 
+ // voxel hashing
+ template <typename T>
+-struct matrix_hash : std::unary_function<T, size_t>
+-{
+-  std::size_t operator()(T const &matrix) const
+-  {
+-    size_t seed = 0;
+-    for (size_t i = 0; i < matrix.size(); ++i)
+-    {
++struct matrix_hash {
++  std::size_t operator()(T const &matrix) const {
++    std::size_t seed = 0;
++    for (std::size_t i = 0; i < static_cast<std::size_t>(matrix.size()); ++i) {
+       auto elem = *(matrix.data() + i);
+       seed ^= std::hash<typename T::Scalar>()(elem) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+     }
+@@ -56,7 +75,7 @@ struct MappingParameters
+   Eigen::Vector3d local_update_range_;
+   double resolution_, resolution_inv_;
+   double obstacles_inflation_;
+-  string frame_id_;
++  std::string frame_id_;
+   int pose_type_;
+ 
+   /* camera parameters */
+@@ -122,15 +141,17 @@ struct MappingData
+ 
+   // depth image projected point cloud
+ 
+-  vector<Eigen::Vector3d> proj_points_;
++  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> proj_points_;
+   int proj_points_cnt;
+ 
++
+   // flag buffers for speeding up raycasting
+ 
+-  vector<short> count_hit_, count_hit_and_miss_;
+-  vector<char> flag_traverse_, flag_rayend_;
+-  char raycast_num_;
+-  queue<Eigen::Vector3i> cache_voxel_;
++  std::vector<short> count_hit_, count_hit_and_miss_;
++  std::vector<uint32_t> flag_traverse_, flag_rayend_;
++  uint32_t raycast_num_;
++  using AlignedDequeV3i = std::deque<Eigen::Vector3i, Eigen::aligned_allocator<Eigen::Vector3i>>;
++  std::queue<Eigen::Vector3i, AlignedDequeV3i> cache_voxel_;
+ 
+   // range of updating grid
+ 
+@@ -147,6 +168,10 @@ struct MappingData
+ class GridMap
+ {
+ public:
++  inline int getVoxelNum() const {
++    return mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2);
++  }
++
+   GridMap() {}
+   ~GridMap() {}
+ 
+@@ -164,7 +189,7 @@ public:
+   inline void posToIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &id);
+   inline void indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos);
+   inline int toAddress(const Eigen::Vector3i &id);
+-  inline int toAddress(int &x, int &y, int &z);
++  inline int toAddress(const int &x, const int &y, const int &z);
+   inline bool isInMap(const Eigen::Vector3d &pos);
+   inline bool isInMap(const Eigen::Vector3i &idx);
+ 
+@@ -192,7 +217,7 @@ public:
+   void getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size);
+   inline double getResolution();
+   Eigen::Vector3d getOrigin();
+-  int getVoxelNum();
++  
+   bool getOdomDepthTimeout() { return md_.flag_depth_odom_timeout_; }
+ 
+   typedef std::shared_ptr<GridMap> Ptr;
+@@ -204,12 +229,22 @@ private:
+   MappingData md_;
+ 
+   // get depth image and camera pose
+-  void depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+-                         const geometry_msgs::msg::PoseStamped::ConstPtr &pose);
+-  void extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom);
+-  void depthOdomCallback(const sensor_msgs::msg::Image::ConstPtr &img, const nav_msgs::msg::Odometry::ConstPtr &odom);
+-  void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img);
++  void depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr img,
++                         const geometry_msgs::msg::PoseStamped::ConstSharedPtr pose);
++  void depthOdomCallback(const sensor_msgs::msg::Image::ConstSharedPtr img,
++                         const nav_msgs::msg::Odometry::ConstSharedPtr odom);
++  void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr img);
++  void extrinsicCallback(const nav_msgs::msg::Odometry::ConstSharedPtr odom);
+   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom);
++  void replanStatusCallback(const std_msgs::msg::Bool::SharedPtr msg);
++  void replanAttemptCallback(const std_msgs::msg::Empty::SharedPtr msg);
++  void applySectorFilter(pcl::PointCloud<pcl::PointXYZ>& cloud_map);
++  void applySectorFilterSensorFrame(pcl::PointCloud<pcl::PointXYZ>& cloud_sensor);
++
++public:
++  void armFullViewRecovery(const std::string& reason, double hold_sec = -1.0);
++
++private:
+ 
+   // update occupancy by raycasting
+   void updateOccupancyCallback();
+@@ -220,7 +255,7 @@ private:
+   void raycastProcess();
+   void clearAndInflateLocalMap();
+ 
+-  inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
++  inline void inflatePoint(const Eigen::Vector3i &pt, int step, std::vector<Eigen::Vector3i> &pts);
+   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
+   Eigen::Vector3d closetPointInMap(const Eigen::Vector3d &pt, const Eigen::Vector3d &camera_pt);
+ 
+@@ -232,19 +267,23 @@ private:
+       SyncPolicyImageOdom;
+   typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, geometry_msgs::msg::PoseStamped>
+       SyncPolicyImagePose;
+-  typedef shared_ptr<message_filters::Synchronizer<SyncPolicyImagePose>> SynchronizerImagePose;
+-  typedef shared_ptr<message_filters::Synchronizer<SyncPolicyImageOdom>> SynchronizerImageOdom;
++  typedef std::shared_ptr<message_filters::Synchronizer<SyncPolicyImagePose>> SynchronizerImagePose;
++  typedef std::shared_ptr<message_filters::Synchronizer<SyncPolicyImageOdom>> SynchronizerImageOdom;
+ 
+   rclcpp::Node::SharedPtr node_;
+   std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> depth_sub_;
+   std::shared_ptr<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>> pose_sub_;
+   std::shared_ptr<message_filters::Subscriber<nav_msgs::msg::Odometry>> odom_sub_;
++  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
++  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+   SynchronizerImagePose sync_image_pose_;
+   SynchronizerImageOdom sync_image_odom_;
+ 
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr indep_cloud_sub_;
+   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr indep_odom_sub_;
+   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr extrinsic_sub_;
++  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr replan_sub_;
++  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr replan_attempt_sub_;
+ 
+   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
+@@ -253,9 +292,37 @@ private:
+   rclcpp::TimerBase::SharedPtr vis_timer_;
+ 
+   //
+-  uniform_real_distribution<double> rand_noise_;
+-  normal_distribution<double> rand_noise2_;
+-  default_random_engine eng_;
++  std::uniform_real_distribution<double> rand_noise_;
++  std::normal_distribution<double> rand_noise2_;
++  std::default_random_engine eng_;
++
++  // Embedded sector filter params/state.
++  bool sf_enable_{false};
++  double sf_min_angle_rad_{-M_PI / 3.0};
++  double sf_max_angle_rad_{M_PI / 3.0};
++  bool sf_use_stride_{false};
++  int sf_stride_{1};
++  bool sf_use_voxel_{false};
++  double sf_voxel_leaf_{0.10};
++  bool sf_adaptive_recovery_{true};
++  std::string sf_replan_status_topic_{"/planning/replan_success"};
++  int sf_replan_fail_threshold_{3};
++  double sf_full_view_hold_sec_{3.0};
++  bool sf_replan_burst_enable_{true};
++  std::string sf_replan_attempt_topic_{"/planning/replan_attempt"};
++  double sf_replan_burst_hold_sec_{0.8};
++  double sf_replan_burst_cooldown_sec_{2.0};
++  bool sf_auto_disable_on_front_block_{true};
++  double sf_front_block_dist_{1.2};
++  int sf_front_block_points_threshold_{20};
++  double sf_front_block_half_angle_rad_{20.0 * M_PI / 180.0};
++  int sf_consecutive_replan_failures_{0};
++  int sf_consecutive_replan_successes_{0};
++  int sf_return_after_n_success_{3};  // full view → 섹터 복귀에 필요한 연속 성공 횟수
++  rclcpp::Time sf_force_full_view_until_;
++  rclcpp::Time sf_next_replan_burst_allowed_;
++  std::atomic<int> sf_full_view_frames_remaining_{0};  // frame-counter fallback
++  bool sf_prev_force_full_view_{false};
+ };
+ 
+ /* ============================== definition of inline function
+@@ -266,7 +333,7 @@ inline int GridMap::toAddress(const Eigen::Vector3i &id)
+   return id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + id(1) * mp_.map_voxel_num_(2) + id(2);
+ }
+ 
+-inline int GridMap::toAddress(int &x, int &y, int &z)
++inline int GridMap::toAddress(const int &x, const int &y, const int &z)
+ {
+   return x * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + y * mp_.map_voxel_num_(2) + z;
+ }
+@@ -274,9 +341,9 @@ inline int GridMap::toAddress(int &x, int &y, int &z)
+ inline void GridMap::boundIndex(Eigen::Vector3i &id)
+ {
+   Eigen::Vector3i id1;
+-  id1(0) = max(min(id(0), mp_.map_voxel_num_(0) - 1), 0);
+-  id1(1) = max(min(id(1), mp_.map_voxel_num_(1) - 1), 0);
+-  id1(2) = max(min(id(2), mp_.map_voxel_num_(2) - 1), 0);
++  id1(0) = std::max(std::min(id(0), mp_.map_voxel_num_(0) - 1), 0);
++  id1(1) = std::max(std::min(id(1), mp_.map_voxel_num_(1) - 1), 0);
++  id1(2) = std::max(std::min(id(2), mp_.map_voxel_num_(2) - 1), 0);
+   id = id1;
+ }
+ 
+@@ -330,7 +397,7 @@ inline void GridMap::setOccupancy(Eigen::Vector3d pos, double occ)
+ {
+   if (occ != 1 && occ != 0)
+   {
+-    cout << "occ value error!" << endl;
++    std::cout << "occ value error!" << std::endl;
+     return;
+   }
+ 
+@@ -407,7 +474,7 @@ inline bool GridMap::isInMap(const Eigen::Vector3i &idx)
+ inline void GridMap::posToIndex(const Eigen::Vector3d &pos, Eigen::Vector3i &id)
+ {
+   for (int i = 0; i < 3; ++i)
+-    id(i) = floor((pos(i) - mp_.map_origin_(i)) * mp_.resolution_inv_);
++    id(i) = static_cast<int>(std::floor((pos(i) - mp_.map_origin_(i)) * mp_.resolution_inv_));
+ }
+ 
+ inline void GridMap::indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos)
+@@ -416,7 +483,7 @@ inline void GridMap::indexToPos(const Eigen::Vector3i &id, Eigen::Vector3d &pos)
+     pos(i) = (id(i) + 0.5) * mp_.resolution_ + mp_.map_origin_(i);
+ }
+ 
+-inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts)
++inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, std::vector<Eigen::Vector3i> &pts)
+ {
+   int num = 0;
+   /* ---------- + shape inflate ---------- */
+@@ -448,4 +515,4 @@ inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Ei
+ 
+ inline double GridMap::getResolution() { return mp_.resolution_; }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/planner/plan_env/package.xml b/src/planner/plan_env/package.xml
+index c9894c7..96e7f8f 100755
+--- a/src/planner/plan_env/package.xml
++++ b/src/planner/plan_env/package.xml
+@@ -17,11 +17,16 @@
+   <depend>nav_msgs</depend> 
+   <depend>cv_bridge</depend> 
+   <depend>message_filters</depend> 
+-  <depend>OpenCV</depend> 
+-  <depend>Eigen3</depend> 
+-  <depend>PCL</depend> 
++  <depend>pcl_ros</depend>
++
+   <depend>pcl_conversions</depend> 
++  <depend>sensor_msgs</depend>
+ 
++  <depend>tf2</depend>
++  <depend>tf2_ros</depend>
++  <depend>tf2_sensor_msgs</depend>
++  <depend>tf2_geometry_msgs</depend>
++  
+   <test_depend>ament_lint_auto</test_depend>
+   <test_depend>ament_lint_common</test_depend>
+ 
+diff --git a/src/planner/plan_env/src/grid_map.cpp b/src/planner/plan_env/src/grid_map.cpp
+index 0714c57..45dc8e5 100755
+--- a/src/planner/plan_env/src/grid_map.cpp
++++ b/src/planner/plan_env/src/grid_map.cpp
+@@ -1,11 +1,25 @@
+ #include "plan_env/grid_map.h"
+ 
++#include <tf2_ros/transform_listener.h>
++#include <tf2_ros/buffer.h>
++#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
++#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp> 
++#include <tf2/exceptions.h>
++
++#include <stdexcept>
++
++#include <sensor_msgs/image_encodings.hpp>
++#include <pcl/common/transforms.h>
++#include <pcl/filters/voxel_grid.h>
++
+ // #define current_img_ md_.depth_image_[image_cnt_ & 1]
+ // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
+ 
+ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+ {
+   node_ = node;
++  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(node_->get_clock());
++  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+ 
+   /* get parameter */
+   double x_size, y_size, z_size;
+@@ -41,10 +55,29 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->declare_parameter("grid_map/virtual_ceil_yn", -0.1);
+   node_->declare_parameter("grid_map/show_occ_time", false);
+   node_->declare_parameter("grid_map/pose_type", 1);
+-  node_->declare_parameter("grid_map/frame_id", "world");
++  node_->declare_parameter("grid_map/frame_id", "map");
+   node_->declare_parameter("grid_map/local_map_margin", 1);
+   node_->declare_parameter("grid_map/ground_height", 1.0);
+   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
++  node_->declare_parameter("grid_map/sector_filter_enable", false);
++  node_->declare_parameter("grid_map/sector_min_angle_deg", -80.0);
++  node_->declare_parameter("grid_map/sector_max_angle_deg", 80.0);
++  node_->declare_parameter("grid_map/sector_use_stride", false);
++  node_->declare_parameter("grid_map/sector_stride", 1);
++  node_->declare_parameter("grid_map/sector_use_voxel", false);
++  node_->declare_parameter("grid_map/sector_voxel_leaf", 0.10);
++  node_->declare_parameter("grid_map/sector_adaptive_recovery", true);
++  node_->declare_parameter("grid_map/sector_replan_status_topic", "/planning/replan_success");
++  node_->declare_parameter("grid_map/sector_replan_fail_threshold", 1);
++  node_->declare_parameter("grid_map/sector_full_view_hold_sec", 2.0);
++  node_->declare_parameter("grid_map/sector_replan_burst_enable", false);
++  node_->declare_parameter("grid_map/sector_replan_attempt_topic", "/planning/replan_attempt");
++  node_->declare_parameter("grid_map/sector_replan_burst_hold_sec", 0.8);
++  node_->declare_parameter("grid_map/sector_replan_burst_cooldown_sec", 2.0);
++  node_->declare_parameter("grid_map/sector_auto_disable_on_front_block", false);
++  node_->declare_parameter("grid_map/sector_front_block_dist", 2.0);
++  node_->declare_parameter("grid_map/sector_front_block_points_threshold", 15);
++  node_->declare_parameter("grid_map/sector_front_block_half_angle_deg", 25.0);
+ 
+   node_->get_parameter("grid_map/resolution", mp_.resolution_);
+   node_->get_parameter("grid_map/map_size_x", x_size);
+@@ -82,12 +115,105 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   node_->get_parameter("grid_map/local_map_margin", mp_.local_map_margin_);
+   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
+   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
++  node_->get_parameter("grid_map/sector_filter_enable", sf_enable_);
++  RCLCPP_INFO(node_->get_logger(), "[GridMap] sector_filter_enable=%d", (int)sf_enable_);
++  node_->get_parameter("grid_map/sector_use_stride", sf_use_stride_);
++  node_->get_parameter("grid_map/sector_use_voxel", sf_use_voxel_);
++  node_->get_parameter("grid_map/sector_adaptive_recovery", sf_adaptive_recovery_);
++  node_->get_parameter("grid_map/sector_replan_burst_enable", sf_replan_burst_enable_);
++  node_->get_parameter("grid_map/sector_auto_disable_on_front_block", sf_auto_disable_on_front_block_);
++
++  double sf_min_angle_deg = -80.0;
++  double sf_max_angle_deg = 80.0;
++  double sf_front_block_half_angle_deg = 25.0;
++  node_->get_parameter("grid_map/sector_min_angle_deg", sf_min_angle_deg);
++  node_->get_parameter("grid_map/sector_max_angle_deg", sf_max_angle_deg);
++  node_->get_parameter("grid_map/sector_stride", sf_stride_);
++  node_->get_parameter("grid_map/sector_voxel_leaf", sf_voxel_leaf_);
++  node_->get_parameter("grid_map/sector_replan_status_topic", sf_replan_status_topic_);
++  node_->get_parameter("grid_map/sector_replan_fail_threshold", sf_replan_fail_threshold_);
++  node_->get_parameter("grid_map/sector_full_view_hold_sec", sf_full_view_hold_sec_);
++  node_->get_parameter("grid_map/sector_replan_attempt_topic", sf_replan_attempt_topic_);
++  node_->get_parameter("grid_map/sector_replan_burst_hold_sec", sf_replan_burst_hold_sec_);
++  node_->get_parameter("grid_map/sector_replan_burst_cooldown_sec", sf_replan_burst_cooldown_sec_);
++  node_->get_parameter("grid_map/sector_front_block_dist", sf_front_block_dist_);
++  node_->get_parameter("grid_map/sector_front_block_points_threshold", sf_front_block_points_threshold_);
++  node_->get_parameter("grid_map/sector_front_block_half_angle_deg", sf_front_block_half_angle_deg);
++  sf_min_angle_rad_ = sf_min_angle_deg * M_PI / 180.0;
++  sf_max_angle_rad_ = sf_max_angle_deg * M_PI / 180.0;
++  sf_front_block_half_angle_rad_ = sf_front_block_half_angle_deg * M_PI / 180.0;
++
++  // ---- parameter sanity (중요) ----
++  if (mp_.resolution_ <= 0.0) {
++    RCLCPP_FATAL(node_->get_logger(),
++                 "[GridMap] resolution(%.3f) invalid. Check params!", mp_.resolution_);
++    // 여기서는 강제값 넣기보다, 죽이는게 안전함
++    throw std::runtime_error("GridMap resolution invalid");
++  }
++
++  if (mp_.local_update_range_.minCoeff() <= 0.0) {
++    RCLCPP_WARN(node_->get_logger(),
++                "[GridMap] local_update_range invalid (%.2f,%.2f,%.2f). Force to (5,5,3).",
++                mp_.local_update_range_.x(), mp_.local_update_range_.y(), mp_.local_update_range_.z());
++    mp_.local_update_range_ = Eigen::Vector3d(5.0, 5.0, 3.0);
++  }
++
++  if (mp_.obstacles_inflation_ <= 0.0) {
++    RCLCPP_WARN(node_->get_logger(),
++                "[GridMap] obstacles_inflation(%.3f) invalid. Force to 0.2.",
++                mp_.obstacles_inflation_);
++    mp_.obstacles_inflation_ = 0.2;
++  }
++
++  if (mp_.k_depth_scaling_factor_ <= 0.0) {
++    RCLCPP_WARN(node_->get_logger(),
++                "[GridMap] k_depth_scaling_factor(%.3f) invalid. Force to 1000.0",
++                mp_.k_depth_scaling_factor_);
++    mp_.k_depth_scaling_factor_ = 1000.0;
++  }
++
++  if (mp_.max_ray_length_ <= 0.0) {
++    RCLCPP_WARN(node_->get_logger(),
++                "[GridMap] max_ray_length(%.3f) invalid. Force to 5.0",
++                mp_.max_ray_length_);
++    mp_.max_ray_length_ = 5.0;
++  }
++
++  if (mp_.min_ray_length_ < 0.0) {
++    mp_.min_ray_length_ = 0.0;
++  }
++
++  if (mp_.use_depth_filter_) {
++    if (mp_.depth_filter_maxdist_ <= 0.0) {
++      RCLCPP_WARN(node_->get_logger(),
++                "[GridMap] use_depth_filter=true but depth_filter_maxdist(%.3f) invalid. "
++                "Set depth_filter_maxdist = max_ray_length(%.3f)",
++                mp_.depth_filter_maxdist_, mp_.max_ray_length_);
++      mp_.depth_filter_maxdist_ = mp_.max_ray_length_;
++    }
++
++    if (mp_.depth_filter_mindist_ < 0.0) {
++      mp_.depth_filter_mindist_ = mp_.min_ray_length_;
++    }
++  }
+ 
+   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
+   {
+     mp_.virtual_ceil_height_ = mp_.ground_height_ + z_size;
+   }
+ 
++  if (sf_stride_ < 1) sf_stride_ = 1;
++  if (sf_voxel_leaf_ <= 0.0) sf_voxel_leaf_ = 0.10;
++  if (sf_replan_fail_threshold_ < 1) sf_replan_fail_threshold_ = 1;
++  if (sf_full_view_hold_sec_ < 0.1) sf_full_view_hold_sec_ = 0.1;
++  if (sf_replan_burst_hold_sec_ < 0.1) sf_replan_burst_hold_sec_ = 0.1;
++  if (sf_replan_burst_cooldown_sec_ < 0.0) sf_replan_burst_cooldown_sec_ = 0.0;
++  if (sf_front_block_dist_ < 0.1) sf_front_block_dist_ = 0.1;
++  if (sf_front_block_points_threshold_ < 1) sf_front_block_points_threshold_ = 1;
++  sf_front_block_half_angle_rad_ = std::max(0.0, std::min(sf_front_block_half_angle_rad_, M_PI));
++  sf_force_full_view_until_ = node_->now();
++  sf_next_replan_burst_allowed_ = node_->now();
++
+   mp_.resolution_inv_ = 1 / mp_.resolution_;
+   mp_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, mp_.ground_height_);
+   mp_.map_size_ = Eigen::Vector3d(x_size, y_size, z_size);
+@@ -99,14 +225,14 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   mp_.min_occupancy_log_ = logit(mp_.p_occ_);
+   mp_.unknown_flag_ = 0.01;
+ 
+-  cout << "hit: " << mp_.prob_hit_log_ << endl;
+-  cout << "miss: " << mp_.prob_miss_log_ << endl;
+-  cout << "min log: " << mp_.clamp_min_log_ << endl;
+-  cout << "max: " << mp_.clamp_max_log_ << endl;
+-  cout << "thresh log: " << mp_.min_occupancy_log_ << endl;
++  std::cout << "hit: " << mp_.prob_hit_log_ << std::endl;
++  std::cout << "miss: " << mp_.prob_miss_log_ << std::endl;
++  std::cout << "min log: " << mp_.clamp_min_log_ << std::endl;
++  std::cout << "max: " << mp_.clamp_max_log_ << std::endl;
++  std::cout << "thresh log: " << mp_.min_occupancy_log_ << std::endl;
+ 
+   for (int i = 0; i < 3; ++i)
+-    mp_.map_voxel_num_(i) = ceil(mp_.map_size_(i) / mp_.resolution_);
++    mp_.map_voxel_num_(i) = std::ceil(mp_.map_size_(i) / mp_.resolution_);
+ 
+   mp_.map_min_boundary_ = mp_.map_origin_;
+   mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
+@@ -115,29 +241,32 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+ 
+   int buffer_size = mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2);
+ 
+-  md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
+-  md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
++  md_.occupancy_buffer_ = std::vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
++  md_.occupancy_buffer_inflate_ = std::vector<char>(buffer_size, 0);
+ 
+-  md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
+-  md_.count_hit_ = vector<short>(buffer_size, 0);
+-  md_.flag_rayend_ = vector<char>(buffer_size, -1);
+-  md_.flag_traverse_ = vector<char>(buffer_size, -1);
+-
+-  md_.raycast_num_ = 0;
++  md_.count_hit_and_miss_ = std::vector<short>(buffer_size, 0);
++  md_.count_hit_ = std::vector<short>(buffer_size, 0);
++  md_.flag_rayend_ = std::vector<uint32_t>(buffer_size, 0);
++  md_.flag_traverse_ = std::vector<uint32_t>(buffer_size, 0);
+ 
++  md_.raycast_num_ = 0u;
++  
++  if (mp_.skip_pixel_ <= 0) mp_.skip_pixel_ = 1;
+   md_.proj_points_.resize(640 * 480 / mp_.skip_pixel_ / mp_.skip_pixel_);
+   md_.proj_points_cnt = 0;
+ 
++
+   md_.cam2body_ << 0.0, 0.0, 1.0, 0.0,
+       -1.0, 0.0, 0.0, 0.0,
+       0.0, -1.0, 0.0, 0.0,
+       0.0, 0.0, 0.0, 1.0;
+ 
+   /* init callback */
+-
++  auto qos_sensor = rclcpp::SensorDataQoS();
++  auto rmw_qos_sensor = qos_sensor.get_rmw_qos_profile(); 
+   // 初始化 message_filters::Subscriber
+   depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+-      node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
++      node_, "grid_map/depth", rmw_qos_sensor);
+ 
+   extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+       "/vins_estimator/extrinsic", 10,
+@@ -146,7 +275,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   if (mp_.pose_type_ == POSE_STAMPED)
+   {
+     pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
+-        node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
++        node_, "grid_map/pose", rmw_qos_sensor);
+ 
+     sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
+         SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
+@@ -156,7 +285,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   else if (mp_.pose_type_ == ODOMETRY)
+   {
+     odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
+-        node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
++        node_, "grid_map/odom", rmw_qos_sensor);
+ 
+     sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
+         SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
+@@ -165,19 +294,41 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   }
+ 
+   // 使用独立的里程计和点云订阅
++  // cloud/odom 콜백은 ReentrantCallbackGroup → A* 타이머와 병렬 실행 가능
++  // (ROS1 AsyncSpinner(4) 동작과 동일)
++  auto reentrant_group = node_->create_callback_group(
++      rclcpp::CallbackGroupType::Reentrant);
++  auto sub_opts = rclcpp::SubscriptionOptions();
++  sub_opts.callback_group = reentrant_group;
++
+   indep_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+-      "grid_map/cloud", 10, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
++      "grid_map/cloud", qos_sensor,
++      std::bind(&GridMap::cloudCallback, this, std::placeholders::_1),
++      sub_opts);
+ 
+   indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+-      "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
++      "grid_map/odom", qos_sensor,
++      std::bind(&GridMap::odomCallback, this, std::placeholders::_1),
++      sub_opts);
++
++  if (sf_enable_ && sf_adaptive_recovery_) {
++    replan_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
++        sf_replan_status_topic_, 10,
++        std::bind(&GridMap::replanStatusCallback, this, std::placeholders::_1));
++    if (sf_replan_burst_enable_) {
++      replan_attempt_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
++          sf_replan_attempt_topic_, 10,
++          std::bind(&GridMap::replanAttemptCallback, this, std::placeholders::_1));
++    }
++  }
+ 
+   // 定时器
+   occ_timer_ = node_->create_wall_timer(
+-      std::chrono::duration<double>(0.05),
++      std::chrono::duration<double>(0.5),  // LiDAR 모드에서 즉시 return → 낮은 빈도로 충분
+       std::bind(&GridMap::updateOccupancyCallback, this));
+ 
+   vis_timer_ = node_->create_wall_timer(
+-      std::chrono::duration<double>(0.11),
++      std::chrono::duration<double>(0.20),
+       std::bind(&GridMap::visCallback, this));
+ 
+   // 发布者
+@@ -199,6 +350,18 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
+   md_.flag_depth_odom_timeout_ = false;
+   md_.flag_use_depth_fusion = false;
+ 
++  if (sf_enable_) {
++    RCLCPP_INFO(node_->get_logger(),
++                "[GridMap] embedded sector_filter enabled: angle=[%.1f, %.1f]deg stride=%d voxel=%d adaptive=%d",
++                sf_min_angle_rad_ * 180.0 / M_PI,
++                sf_max_angle_rad_ * 180.0 / M_PI,
++                sf_use_stride_ ? sf_stride_ : 1,
++                sf_use_voxel_ ? 1 : 0,
++                sf_adaptive_recovery_ ? 1 : 0);
++  } else {
++    RCLCPP_INFO(node_->get_logger(), "[GridMap] embedded sector_filter disabled");
++  }
++
+   // rand_noise_ = uniform_real_distribution<double>(-0.2, 0.2);
+   // rand_noise2_ = normal_distribution<double>(0, 0.2);
+   // random_device rd;
+@@ -259,110 +422,100 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
+ 
+ void GridMap::projectDepthImage()
+ {
+-  // md_.proj_points_.clear();
+-  md_.proj_points_cnt = 0;
++  const int cols = md_.depth_image_.cols;
++  const int rows = md_.depth_image_.rows;
++  const int skip_pix = std::max(1, mp_.skip_pixel_);
++
++  const std::size_t need =
++      (std::size_t)((cols + skip_pix - 1) / skip_pix) *
++      (std::size_t)((rows + skip_pix - 1) / skip_pix);
+ 
+-  uint16_t *row_ptr;
+-  // int cols = current_img_.cols, rows = current_img_.rows;
+-  int cols = md_.depth_image_.cols;
+-  int rows = md_.depth_image_.rows;
+-  int skip_pix = mp_.skip_pixel_;
++  if (md_.proj_points_.size() < need) md_.proj_points_.resize(need);
++  md_.proj_points_cnt = 0;
+ 
+-  double depth;
++  const Eigen::Matrix3d camera_r = md_.camera_r_m_;
+ 
+-  Eigen::Matrix3d camera_r = md_.camera_r_m_;
++  // scaling factor 안전 가드
++  const double inv_scale =
++      (mp_.k_depth_scaling_factor_ > 0.0) ? (1.0 / mp_.k_depth_scaling_factor_) : 1.0;
+ 
+   if (!mp_.use_depth_filter_)
+   {
++    // ✅✅✅ (추가) filter를 안 써도 "depth 한번이라도 받았다" 플래그는 켜줘야 함
++    if (!md_.has_first_depth_) md_.has_first_depth_ = true;
++
+     for (int v = 0; v < rows; v += skip_pix)
+     {
+-      row_ptr = md_.depth_image_.ptr<uint16_t>(v);
++      const uint16_t* row = md_.depth_image_.ptr<uint16_t>(v);
+ 
+       for (int u = 0; u < cols; u += skip_pix)
+       {
++        const uint16_t raw = row[u];
++        double depth = static_cast<double>(raw) * inv_scale;
++
++        if (raw == 0)
++          depth = mp_.max_ray_length_ + 0.1;
+ 
+         Eigen::Vector3d proj_pt;
+-        depth = (*row_ptr++) / mp_.k_depth_scaling_factor_;
+         proj_pt(0) = (u - mp_.cx_) * depth / mp_.fx_;
+         proj_pt(1) = (v - mp_.cy_) * depth / mp_.fy_;
+         proj_pt(2) = depth;
+ 
+         proj_pt = camera_r * proj_pt + md_.camera_pos_;
+-
+-        if (u == 320 && v == 240)
+-          std::cout << "depth: " << depth << std::endl;
+         md_.proj_points_[md_.proj_points_cnt++] = proj_pt;
+       }
+     }
+   }
+-  /* use depth filter */
+   else
+   {
+-
++    // depth filter를 쓰는 경우: 첫 프레임은 "이전 프레임 없음"이라서 체크 안 함
+     if (!md_.has_first_depth_)
++    {
+       md_.has_first_depth_ = true;
++    }
+     else
+     {
+-      Eigen::Vector3d pt_cur, pt_world, pt_reproj;
++      Eigen::Matrix3d last_camera_r_inv = md_.last_camera_r_m_.inverse();
++      const int margin = std::max(0, mp_.depth_filter_margin_);
+ 
+-      Eigen::Matrix3d last_camera_r_inv;
+-      last_camera_r_inv = md_.last_camera_r_m_.inverse();
+-      const double inv_factor = 1.0 / mp_.k_depth_scaling_factor_;
+-
+-      for (int v = mp_.depth_filter_margin_; v < rows - mp_.depth_filter_margin_; v += mp_.skip_pixel_)
++      for (int v = margin; v < rows - margin; v += skip_pix)
+       {
+-        row_ptr = md_.depth_image_.ptr<uint16_t>(v) + mp_.depth_filter_margin_;
++        const uint16_t* row = md_.depth_image_.ptr<uint16_t>(v);
+ 
+-        for (int u = mp_.depth_filter_margin_; u < cols - mp_.depth_filter_margin_;
+-             u += mp_.skip_pixel_)
++        for (int u = margin; u < cols - margin; u += skip_pix)
+         {
++          const uint16_t raw = row[u];
++          double depth = static_cast<double>(raw) * inv_scale;
+ 
+-          depth = (*row_ptr) * inv_factor;
+-          row_ptr = row_ptr + mp_.skip_pixel_;
+-
+-          // filter depth
+-          // depth += rand_noise_(eng_);
+-          // if (depth > 0.01) depth += rand_noise2_(eng_);
+-
+-          if (*row_ptr == 0)
+-          {
++          if (raw == 0)
+             depth = mp_.max_ray_length_ + 0.1;
+-          }
+           else if (depth < mp_.depth_filter_mindist_)
+-          {
+             continue;
+-          }
+           else if (depth > mp_.depth_filter_maxdist_)
+-          {
+             depth = mp_.max_ray_length_ + 0.1;
+-          }
+ 
+-          // project to world frame
++          Eigen::Vector3d pt_cur;
+           pt_cur(0) = (u - mp_.cx_) * depth / mp_.fx_;
+           pt_cur(1) = (v - mp_.cy_) * depth / mp_.fy_;
+           pt_cur(2) = depth;
+ 
+-          pt_world = camera_r * pt_cur + md_.camera_pos_;
+-          // if (!isInMap(pt_world)) {
+-          //   pt_world = closetPointInMap(pt_world, md_.camera_pos_);
+-          // }
+-
++          Eigen::Vector3d pt_world = camera_r * pt_cur + md_.camera_pos_;
+           md_.proj_points_[md_.proj_points_cnt++] = pt_world;
+ 
+-          // check consistency with last image, disabled...
++          // consistency check (원 코드 false 유지)
+           if (false)
+           {
+-            pt_reproj = last_camera_r_inv * (pt_world - md_.last_camera_pos_);
+-            double uu = pt_reproj.x() * mp_.fx_ / pt_reproj.z() + mp_.cx_;
+-            double vv = pt_reproj.y() * mp_.fy_ / pt_reproj.z() + mp_.cy_;
++            Eigen::Vector3d pt_reproj = last_camera_r_inv * (pt_world - md_.last_camera_pos_);
++            const double uu = pt_reproj.x() * mp_.fx_ / pt_reproj.z() + mp_.cx_;
++            const double vv = pt_reproj.y() * mp_.fy_ / pt_reproj.z() + mp_.cy_;
+ 
+             if (uu >= 0 && uu < cols && vv >= 0 && vv < rows)
+             {
+-              if (fabs(md_.last_depth_image_.at<uint16_t>((int)vv, (int)uu) * inv_factor -
+-                       pt_reproj.z()) < mp_.depth_filter_tolerance_)
+-              {
++              const uint16_t last_raw = md_.last_depth_image_.at<uint16_t>((int)vv, (int)uu);
++              const double last_depth = static_cast<double>(last_raw) * inv_scale;
++
++              if (std::fabs(last_depth - pt_reproj.z()) < mp_.depth_filter_tolerance_)
+                 md_.proj_points_[md_.proj_points_cnt++] = pt_world;
+-              }
+             }
+             else
+             {
+@@ -374,22 +527,22 @@ void GridMap::projectDepthImage()
+     }
+   }
+ 
+-  /* maintain camera pose for consistency check */
+-
++  // maintain camera pose
+   md_.last_camera_pos_ = md_.camera_pos_;
+   md_.last_camera_r_m_ = md_.camera_r_m_;
+   md_.last_depth_image_ = md_.depth_image_;
+ }
+ 
++
+ void GridMap::raycastProcess()
+ {
+-  // if (md_.proj_points_.size() == 0)
+-  if (md_.proj_points_cnt == 0)
+-    return;
+-
+-  rclcpp::Time t1, t2;
++  if (md_.proj_points_cnt == 0) return;
+ 
+-  md_.raycast_num_ += 1;
++  if (++md_.raycast_num_ == 0u) { // overflow로 0이 되면
++    std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), 0u);
++    std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), 0u);
++    md_.raycast_num_ = 1u;
++  }
+ 
+   int vox_idx;
+   double length;
+@@ -404,7 +557,7 @@ void GridMap::raycastProcess()
+   double max_z = mp_.map_min_boundary_(2);
+ 
+   RayCaster raycaster;
+-  Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
++  Eigen::Vector3d half(0.5, 0.5, 0.5);
+   Eigen::Vector3d ray_pt, pt_w;
+ 
+   for (int i = 0; i < md_.proj_points_cnt; ++i)
+@@ -412,7 +565,6 @@ void GridMap::raycastProcess()
+     pt_w = md_.proj_points_[i];
+ 
+     // set flag for projected point
+-
+     if (!isInMap(pt_w))
+     {
+       pt_w = closetPointInMap(pt_w, md_.camera_pos_);
+@@ -439,26 +591,20 @@ void GridMap::raycastProcess()
+       }
+     }
+ 
+-    max_x = max(max_x, pt_w(0));
+-    max_y = max(max_y, pt_w(1));
+-    max_z = max(max_z, pt_w(2));
+-
+-    min_x = min(min_x, pt_w(0));
+-    min_y = min(min_y, pt_w(1));
+-    min_z = min(min_z, pt_w(2));
++    // ✅ update local AABB
++    max_x = std::max(max_x, pt_w(0));
++    max_y = std::max(max_y, pt_w(1));
++    max_z = std::max(max_z, pt_w(2));
++    min_x = std::min(min_x, pt_w(0));
++    min_y = std::min(min_y, pt_w(1));
++    min_z = std::min(min_z, pt_w(2));
+ 
+     // raycasting between camera center and point
+-
+     if (vox_idx != INVALID_IDX)
+     {
+       if (md_.flag_rayend_[vox_idx] == md_.raycast_num_)
+-      {
+         continue;
+-      }
+-      else
+-      {
+-        md_.flag_rayend_[vox_idx] = md_.raycast_num_;
+-      }
++      md_.flag_rayend_[vox_idx] = md_.raycast_num_;
+     }
+ 
+     raycaster.setInput(pt_w / mp_.resolution_, md_.camera_pos_ / mp_.resolution_);
+@@ -466,34 +612,27 @@ void GridMap::raycastProcess()
+     while (raycaster.step(ray_pt))
+     {
+       Eigen::Vector3d tmp = (ray_pt + half) * mp_.resolution_;
+-      length = (tmp - md_.camera_pos_).norm();
+-
+-      // if (length < mp_.min_ray_length_) break;
+ 
+       vox_idx = setCacheOccupancy(tmp, 0);
+ 
+       if (vox_idx != INVALID_IDX)
+       {
+         if (md_.flag_traverse_[vox_idx] == md_.raycast_num_)
+-        {
+           break;
+-        }
+-        else
+-        {
+-          md_.flag_traverse_[vox_idx] = md_.raycast_num_;
+-        }
++        md_.flag_traverse_[vox_idx] = md_.raycast_num_;
+       }
+     }
+   }
+ 
+-  min_x = min(min_x, md_.camera_pos_(0));
+-  min_y = min(min_y, md_.camera_pos_(1));
+-  min_z = min(min_z, md_.camera_pos_(2));
++  // ✅✅✅ (중요) local_bound 반드시 갱신해야 clear/inflate/publish 범위가 정상
++  min_x = std::min(min_x, md_.camera_pos_(0));
++  min_y = std::min(min_y, md_.camera_pos_(1));
++  min_z = std::min(min_z, md_.camera_pos_(2));
+ 
+-  max_x = max(max_x, md_.camera_pos_(0));
+-  max_y = max(max_y, md_.camera_pos_(1));
+-  max_z = max(max_z, md_.camera_pos_(2));
+-  max_z = max(max_z, mp_.ground_height_);
++  max_x = std::max(max_x, md_.camera_pos_(0));
++  max_y = std::max(max_y, md_.camera_pos_(1));
++  max_z = std::max(max_z, md_.camera_pos_(2));
++  max_z = std::max(max_z, mp_.ground_height_);
+ 
+   posToIndex(Eigen::Vector3d(max_x, max_y, max_z), md_.local_bound_max_);
+   posToIndex(Eigen::Vector3d(min_x, min_y, min_z), md_.local_bound_min_);
+@@ -512,36 +651,35 @@ void GridMap::raycastProcess()
+   boundIndex(min_id);
+   boundIndex(max_id);
+ 
+-  // std::cout << "cache all: " << md_.cache_voxel_.size() << std::endl;
+-
+   while (!md_.cache_voxel_.empty())
+   {
+-
+     Eigen::Vector3i idx = md_.cache_voxel_.front();
+     int idx_ctns = toAddress(idx);
+     md_.cache_voxel_.pop();
+ 
+     double log_odds_update =
+-        md_.count_hit_[idx_ctns] >= md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns] ? mp_.prob_hit_log_ : mp_.prob_miss_log_;
++        md_.count_hit_[idx_ctns] >= (md_.count_hit_and_miss_[idx_ctns] - md_.count_hit_[idx_ctns])
++            ? mp_.prob_hit_log_
++            : mp_.prob_miss_log_;
+ 
+     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
+ 
+     if (log_odds_update >= 0 && md_.occupancy_buffer_[idx_ctns] >= mp_.clamp_max_log_)
+-    {
+       continue;
+-    }
+-    else if (log_odds_update <= 0 && md_.occupancy_buffer_[idx_ctns] <= mp_.clamp_min_log_)
++
++    if (log_odds_update <= 0 && md_.occupancy_buffer_[idx_ctns] <= mp_.clamp_min_log_)
+     {
+       md_.occupancy_buffer_[idx_ctns] = mp_.clamp_min_log_;
+       continue;
+     }
+ 
+-    bool in_local = idx(0) >= min_id(0) && idx(0) <= max_id(0) && idx(1) >= min_id(1) &&
+-                    idx(1) <= max_id(1) && idx(2) >= min_id(2) && idx(2) <= max_id(2);
++    bool in_local =
++        idx(0) >= min_id(0) && idx(0) <= max_id(0) &&
++        idx(1) >= min_id(1) && idx(1) <= max_id(1) &&
++        idx(2) >= min_id(2) && idx(2) <= max_id(2);
++
+     if (!in_local)
+-    {
+       md_.occupancy_buffer_[idx_ctns] = mp_.clamp_min_log_;
+-    }
+ 
+     md_.occupancy_buffer_[idx_ctns] =
+         std::min(std::max(md_.occupancy_buffer_[idx_ctns] + log_odds_update, mp_.clamp_min_log_),
+@@ -559,7 +697,7 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
+ 
+   for (int i = 0; i < 3; ++i)
+   {
+-    if (fabs(diff[i]) > 0)
++    if (std::fabs(diff[i]) > 0)
+     {
+ 
+       double t1 = max_tc[i] / diff[i];
+@@ -650,9 +788,9 @@ void GridMap::clearAndInflateLocalMap()
+ 
+   // inflate occupied voxels to compensate robot size
+ 
+-  int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
++  int inf_step = std::ceil(mp_.obstacles_inflation_ / mp_.resolution_);
+   // int inf_step_z = 1;
+-  vector<Eigen::Vector3i> inf_pts(pow(2 * inf_step + 1, 3));
++  std::vector<Eigen::Vector3i> inf_pts(pow(2 * inf_step + 1, 3));
+   // inf_pts.resize(4 * inf_step + 3);
+   Eigen::Vector3i inf_pt;
+ 
+@@ -689,15 +827,16 @@ void GridMap::clearAndInflateLocalMap()
+       }
+ 
+   // add virtual ceiling to limit flight height
+-  if (mp_.virtual_ceil_height_ > -0.5)
+-  {
+-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+-      {
+-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
+-      }
++  if (mp_.virtual_ceil_height_ > -0.5) {
++    int ceil_id = (int)std::floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
++
++    if (ceil_id >= 0 && ceil_id < mp_.map_voxel_num_(2)) {
++      for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
++        for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
++          md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
++    }
+   }
++
+ }
+ 
+ void GridMap::visCallback()
+@@ -722,6 +861,8 @@ void GridMap::updateOccupancyCallback()
+                    md_.last_occ_update_time_.seconds(),
+                    mp_.odom_depth_timeout_);
+       md_.flag_depth_odom_timeout_ = true;
++      md_.flag_use_depth_fusion = false;  // ✅ odomCallback 재활성화
++      md_.occ_need_update_ = false;       // ✅ depth 없으니 업데이트 중단
+     }
+     return;
+   }
+@@ -755,18 +896,279 @@ void GridMap::updateOccupancyCallback()
+   md_.local_updated_ = false;
+ }
+ 
+-void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+-                                const geometry_msgs::msg::PoseStamped::ConstPtr &pose)
++void GridMap::armFullViewRecovery(const std::string& reason, double hold_sec)
++{
++  if (!sf_enable_) return;  // sector filter 비활성화 시 무시
++  const double use_hold_sec = (hold_sec > 0.0) ? hold_sec : sf_full_view_hold_sec_;
++
++  // 호출 시점에 이미 full view 모드인지 확인
++  const auto now = node_->now();
++  const int prev_frames = sf_full_view_frames_remaining_.load();
++  const bool was_in_full_view = (now < sf_force_full_view_until_) || (prev_frames > 0);
++
++  // 상태 업데이트
++  const auto until = now + rclcpp::Duration::from_seconds(use_hold_sec);
++  const int frames = std::max(40, static_cast<int>(use_hold_sec * 20.0));
++  if (until > sf_force_full_view_until_) {
++    sf_force_full_view_until_ = until;
++  }
++  sf_full_view_frames_remaining_.store(std::max(prev_frames, frames));
++
++  // sector → full view 전환 시에만 로그
++  if (!was_in_full_view) {
++    RCLCPP_WARN(node_->get_logger(),
++                "[GridMap] Sector full-view recovery %.2fs / %d frames (%s)",
++                use_hold_sec, frames, reason.c_str());
++  }
++}
++
++void GridMap::replanStatusCallback(const std_msgs::msg::Bool::SharedPtr msg)
++{
++  if (!sf_enable_ || !sf_adaptive_recovery_) return;
++
++  const bool in_full_view = (node_->now() < sf_force_full_view_until_);
++
++  if (msg->data) {
++    // 리플래닝 성공
++    sf_consecutive_replan_failures_ = 0;
++
++    if (in_full_view) {
++      // 실패 기반 복구(3600s hold)만 성공 카운터로 조기 복귀
++      // 시간 기반 복구(웨이포인트 등, 짧은 hold)는 자연 만료에 맡김
++      const double remaining = (sf_force_full_view_until_ - node_->now()).seconds();
++      const bool is_failure_recovery = (remaining > 30.0);
++      if (is_failure_recovery) {
++        sf_consecutive_replan_successes_++;
++        if (sf_consecutive_replan_successes_ >= sf_return_after_n_success_) {
++          sf_force_full_view_until_ = node_->now();  // 시간 카운터 리셋
++          sf_full_view_frames_remaining_.store(0);   // 프레임 카운터도 리셋
++          sf_consecutive_replan_successes_ = 0;
++          RCLCPP_INFO(node_->get_logger(),
++            "[GridMap] Sector filter restored after %d consecutive successes",
++            sf_return_after_n_success_);
++        }
++      }
++    } else {
++      sf_consecutive_replan_successes_ = 0;
++    }
++    return;
++  }
++
++  // 리플래닝 실패
++  sf_consecutive_replan_successes_ = 0;
++  sf_consecutive_replan_failures_++;
++  if (sf_consecutive_replan_failures_ >= sf_replan_fail_threshold_) {
++    // full view hold: 시간 기반 대신 성공 횟수 기반으로 복귀하므로
++    // hold_sec을 매우 길게 설정 (성공 카운터가 복귀 조건)
++    armFullViewRecovery("replan failures", 3600.0);
++    sf_consecutive_replan_failures_ = 0;
++    sf_consecutive_replan_successes_ = 0;
++  }
++}
++
++void GridMap::replanAttemptCallback(const std_msgs::msg::Empty::SharedPtr /*msg*/)
++{
++  if (!sf_enable_ || !sf_adaptive_recovery_ || !sf_replan_burst_enable_) return;
++
++  const auto now = node_->now();
++  if (now < sf_next_replan_burst_allowed_) {
++    return;
++  }
++  armFullViewRecovery("replan burst", sf_replan_burst_hold_sec_);
++  sf_next_replan_burst_allowed_ =
++      now + rclcpp::Duration::from_seconds(sf_replan_burst_cooldown_sec_);
++}
++
++// 기존: map frame에서 역회전 후 각도 필터 (source==target 또는 fallback 경로용)
++void GridMap::applySectorFilter(pcl::PointCloud<pcl::PointXYZ>& cloud_map)
++{
++  if (!sf_enable_ || cloud_map.points.empty()) return;
++  if (!md_.has_odom_) return;
++
++  const int frames_left = sf_full_view_frames_remaining_.load();
++  const auto now = node_->now();
++  const bool time_based = sf_adaptive_recovery_ && (now < sf_force_full_view_until_);
++  const bool frame_based = sf_adaptive_recovery_ && (frames_left > 0);
++  bool force_full_view = time_based || frame_based;
++
++  pcl::PointCloud<pcl::PointXYZ> filtered;
++  filtered.header = cloud_map.header;
++  filtered.points.reserve(cloud_map.points.size());
++
++  const Eigen::Matrix3d world_to_sensor = md_.camera_r_m_.transpose();
++  int front_block_points = 0;
++
++  for (size_t i = 0; i < cloud_map.points.size(); ++i) {
++    if (sf_use_stride_ && (i % static_cast<size_t>(sf_stride_) != 0)) continue;
++
++    const auto& p = cloud_map.points[i];
++    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
++
++    const Eigen::Vector3d pw(p.x, p.y, p.z);
++    const Eigen::Vector3d ps = world_to_sensor * (pw - md_.camera_pos_);
++    const double ang = std::atan2(ps.y(), ps.x());
++
++    if (sf_adaptive_recovery_ && sf_auto_disable_on_front_block_) {
++      const double range_xy = std::hypot(ps.x(), ps.y());
++      if (range_xy < sf_front_block_dist_ && std::fabs(ang) <= sf_front_block_half_angle_rad_) {
++        ++front_block_points;
++      }
++    }
++
++    if (!force_full_view) {
++      if (ang < sf_min_angle_rad_ || ang > sf_max_angle_rad_) continue;
++    }
++
++    filtered.points.push_back(p);
++  }
++
++  if (!force_full_view && sf_adaptive_recovery_ && sf_auto_disable_on_front_block_ &&
++      front_block_points >= sf_front_block_points_threshold_) {
++    armFullViewRecovery("front blocked");
++
++    filtered.clear();
++    filtered.points.reserve(cloud_map.points.size());
++    for (size_t i = 0; i < cloud_map.points.size(); ++i) {
++      if (sf_use_stride_ && (i % static_cast<size_t>(sf_stride_) != 0)) continue;
++      const auto& p = cloud_map.points[i];
++      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
++      filtered.points.push_back(p);
++    }
++  }
++
++  // Avoid map update stalls when sector constraints are temporarily too strict.
++  // If filtered cloud is empty, keep the original raw cloud for this frame.
++  if (filtered.points.empty()) {
++    RCLCPP_WARN_THROTTLE(
++        node_->get_logger(), *node_->get_clock(), 2000,
++        "[GridMap] sector filter produced empty cloud. Falling back to raw cloud.");
++    return;
++  }
++
++  filtered.width = static_cast<uint32_t>(filtered.points.size());
++  filtered.height = 1;
++  filtered.is_dense = false;
++
++  if (sf_use_voxel_ && !filtered.points.empty()) {
++    pcl::PointCloud<pcl::PointXYZ> voxel_out;
++    pcl::VoxelGrid<pcl::PointXYZ> vg;
++    vg.setInputCloud(filtered.makeShared());
++    vg.setLeafSize(static_cast<float>(sf_voxel_leaf_),
++                   static_cast<float>(sf_voxel_leaf_),
++                   static_cast<float>(sf_voxel_leaf_));
++    vg.filter(voxel_out);
++    voxel_out.header = filtered.header;
++    cloud_map.swap(voxel_out);
++  } else {
++    cloud_map.swap(filtered);
++  }
++}
++
++// 최적화: sensor frame에서 직접 각도 필터 (TF 변환 전에 호출, 역회전 불필요)
++void GridMap::applySectorFilterSensorFrame(pcl::PointCloud<pcl::PointXYZ>& cloud_sensor)
+ {
++  if (!sf_enable_ || cloud_sensor.points.empty()) return;
++
++  // Frame-counter: decrement each call, use full view while > 0
++  const int frames_left = sf_full_view_frames_remaining_.load();
++  if (frames_left > 0) sf_full_view_frames_remaining_.store(frames_left - 1);
++
++  const auto now = node_->now();
++  const bool time_based = sf_adaptive_recovery_ && (now < sf_force_full_view_until_);
++  const bool frame_based = sf_adaptive_recovery_ && (frames_left > 0);
++  bool force_full_view = time_based || frame_based;
++
++  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
++    "[GridMap] sector filter: force_full=%d (time=%d frames=%d left=%d)",
++    force_full_view, time_based, frame_based, frames_left);
++
++  pcl::PointCloud<pcl::PointXYZ> filtered;
++  filtered.header = cloud_sensor.header;
++  filtered.points.reserve(cloud_sensor.points.size());
++
++  int front_block_points = 0;
++
++  for (size_t i = 0; i < cloud_sensor.points.size(); ++i) {
++    if (sf_use_stride_ && (i % static_cast<size_t>(sf_stride_) != 0)) continue;
++
++    const auto& p = cloud_sensor.points[i];
++    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
++
++    // sensor frame이므로 역회전 없이 바로 수평 각도 계산
++    const double ang = std::atan2(static_cast<double>(p.y), static_cast<double>(p.x));
++
++    if (sf_adaptive_recovery_ && sf_auto_disable_on_front_block_) {
++      const double range_xy = std::hypot(static_cast<double>(p.x), static_cast<double>(p.y));
++      if (range_xy < sf_front_block_dist_ && std::fabs(ang) <= sf_front_block_half_angle_rad_) {
++        ++front_block_points;
++      }
++    }
++
++    if (!force_full_view) {
++      if (ang < sf_min_angle_rad_ || ang > sf_max_angle_rad_) continue;
++    }
++
++    filtered.points.push_back(p);
++  }
++
++  if (!force_full_view && sf_adaptive_recovery_ && sf_auto_disable_on_front_block_ &&
++      front_block_points >= sf_front_block_points_threshold_) {
++    armFullViewRecovery("front blocked");
++
++    filtered.clear();
++    filtered.points.reserve(cloud_sensor.points.size());
++    for (size_t i = 0; i < cloud_sensor.points.size(); ++i) {
++      if (sf_use_stride_ && (i % static_cast<size_t>(sf_stride_) != 0)) continue;
++      const auto& p = cloud_sensor.points[i];
++      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
++      filtered.points.push_back(p);
++    }
++  }
++
++  filtered.width = static_cast<uint32_t>(filtered.points.size());
++  filtered.height = 1;
++  filtered.is_dense = false;
++
++  if (sf_use_voxel_ && !filtered.points.empty()) {
++    pcl::PointCloud<pcl::PointXYZ> voxel_out;
++    pcl::VoxelGrid<pcl::PointXYZ> vg;
++    vg.setInputCloud(filtered.makeShared());
++    vg.setLeafSize(static_cast<float>(sf_voxel_leaf_),
++                   static_cast<float>(sf_voxel_leaf_),
++                   static_cast<float>(sf_voxel_leaf_));
++    vg.filter(voxel_out);
++    voxel_out.header = filtered.header;
++    cloud_sensor.swap(voxel_out);
++  } else {
++    cloud_sensor.swap(filtered);
++  }
++}
++
++void GridMap::depthPoseCallback(
++  const sensor_msgs::msg::Image::ConstSharedPtr img,
++  const geometry_msgs::msg::PoseStamped::ConstSharedPtr pose)
++{
++
++  // ✅ (추가) depth/pose가 들어왔다는 heartbeat: timeout 오탐 방지
++  md_.last_occ_update_time_ = node_->now();
++  md_.flag_depth_odom_timeout_ = false;
++
++
++  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++    "[GridMap] depth callback alive enc=%s size=%ux%u",
++    img->encoding.c_str(), img->width, img->height);
+   /* get depth image */
+   cv_bridge::CvImagePtr cv_ptr;
+   cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
+ 
+   if (img->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
+   {
+-    (cv_ptr->image).convertTo(cv_ptr->image, CV_16UC1, mp_.k_depth_scaling_factor_);
++    double scale = mp_.k_depth_scaling_factor_;
++    if (scale <= 0.0) scale = 1000.0;
++    cv_ptr->image.convertTo(cv_ptr->image, CV_16UC1, scale);
+   }
+   cv_ptr->image.copyTo(md_.depth_image_);
++  md_.flag_use_depth_fusion = true;
+ 
+   // std::cout << "depth: " << md_.depth_image_.cols << ", " << md_.depth_image_.rows << std::endl;
+ 
+@@ -777,9 +1179,11 @@ void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+   md_.camera_r_m_ = Eigen::Quaterniond(pose->pose.orientation.w, pose->pose.orientation.x,
+                                        pose->pose.orientation.y, pose->pose.orientation.z)
+                         .toRotationMatrix();
++
++  md_.has_odom_ = true;
++                          
+   if (isInMap(md_.camera_pos_))
+   {
+-    md_.has_odom_ = true;
+     md_.update_num_ += 1;
+     md_.occ_need_update_ = true;
+   }
+@@ -788,130 +1192,327 @@ void GridMap::depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+     md_.occ_need_update_ = false;
+   }
+ 
+-  md_.flag_use_depth_fusion = true;
+ }
+ 
+ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
+ {
+-  if (md_.has_first_depth_)
++  // depth-fusion(DepthPose/DepthOdom)을 쓰기 시작하면, indep odom으로 pose 덮어쓰지 않음
++  if (md_.flag_use_depth_fusion)
+     return;
+ 
+-  md_.camera_pos_(0) = odom->pose.pose.position.x;
+-  md_.camera_pos_(1) = odom->pose.pose.position.y;
+-  md_.camera_pos_(2) = odom->pose.pose.position.z;
++  const std::string target_frame = mp_.frame_id_;        // 예: "map"
++  const std::string source_frame = odom->header.frame_id; // odom pose 기준 frame
+ 
++  if (source_frame.empty()) {
++    RCLCPP_WARN(node_->get_logger(), "[GridMap] odom frame_id empty, skip");
++    return;
++  }
++
++  geometry_msgs::msg::PoseStamped ps_in, ps_out;
++  ps_in.header = odom->header;
++  ps_in.pose   = odom->pose.pose;
++
++  // 1) 같은 프레임이면 그대로 사용
++  if (source_frame == target_frame) {
++    ps_out = ps_in;
++  } else {
++    // 2) stamp 기준 TF 시도 -> 실패하면 latest로 fallback
++    try {
++      auto tf = tf_buffer_->lookupTransform(
++          target_frame, source_frame,
++          rclcpp::Time(odom->header.stamp),
++          rclcpp::Duration::from_seconds(0.05));
++      tf2::doTransform(ps_in, ps_out, tf);
++
++    } catch (const tf2::TransformException &ex) {
++      RCLCPP_WARN_THROTTLE(
++          node_->get_logger(), *node_->get_clock(), 2000,
++          "[GridMap] odom TF lookup failed (%s -> %s) at stamp: %.3f, err: %s. Fallback to latest.",
++          source_frame.c_str(), target_frame.c_str(),
++          rclcpp::Time(odom->header.stamp).seconds(), ex.what());
++
++      try {
++        auto tf_latest = tf_buffer_->lookupTransform(
++            target_frame, source_frame, tf2::TimePointZero);
++        tf2::doTransform(ps_in, ps_out, tf_latest);
++
++      } catch (const tf2::TransformException &ex2) {
++        // Keep mapping alive even if TF tree is briefly disconnected.
++        // Use raw odom pose as approximate map-frame pose.
++        ps_out = ps_in;
++        RCLCPP_WARN_THROTTLE(
++            node_->get_logger(), *node_->get_clock(), 2000,
++            "[GridMap] odom TF fallback failed (%s -> %s): %s. Using raw odom pose as fallback.",
++            source_frame.c_str(), target_frame.c_str(), ex2.what());
++      }
++    }
++  }
++
++  md_.camera_pos_(0) = ps_out.pose.position.x;
++  md_.camera_pos_(1) = ps_out.pose.position.y;
++  md_.camera_pos_(2) = ps_out.pose.position.z;
++  Eigen::Quaterniond q(ps_out.pose.orientation.w,
++                       ps_out.pose.orientation.x,
++                       ps_out.pose.orientation.y,
++                       ps_out.pose.orientation.z);
++  if (q.norm() > 1e-6) {
++    q.normalize();
++    md_.camera_r_m_ = q.toRotationMatrix();
++  } else {
++    md_.camera_r_m_ = Eigen::Matrix3d::Identity();
++  }
+   md_.has_odom_ = true;
+ }
+ 
+-void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
++void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
+ {
++  if (md_.flag_use_depth_fusion)
++    return;
+ 
+-  pcl::PointCloud<pcl::PointXYZ> latest_cloud;
+-  pcl::fromROSMsg(*img, latest_cloud);
++  const std::string target_frame = mp_.frame_id_;         // "map"
++  const std::string source_frame = msg->header.frame_id;  // 예: lidar/body
++
++  if (source_frame.empty()) {
++    RCLCPP_WARN(node_->get_logger(), "[GridMap] cloud frame_id empty, skip");
++    return;
++  }
+ 
+   md_.has_cloud_ = true;
+ 
+-  if (!md_.has_odom_)
+-  {
+-    std::cout << "no odom!" << std::endl;
++  if (!md_.has_odom_) {
++    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                         "[GridMap] no odom yet, skip cloud");
+     return;
+   }
+ 
+-  if (latest_cloud.points.size() == 0)
++  pcl::PointCloud<pcl::PointXYZ> latest_cloud;
++
++  // 최적화 경로: sensor frame != map frame인 정상 TF 경로
++  // fromROSMsg → sensor frame에서 필터 → 줄어든 포인트만 TF 변환
++  if (sf_enable_ && source_frame != target_frame) {
++    pcl::PointCloud<pcl::PointXYZ> cloud_sensor;
++    pcl::fromROSMsg(*msg, cloud_sensor);
++    const size_t before = cloud_sensor.points.size();
++
++    applySectorFilterSensorFrame(cloud_sensor);
++
++    if (cloud_sensor.points.empty()) return;
++
++    geometry_msgs::msg::TransformStamped tf_stamped;
++    bool tf_ok = false;
++    try {
++      tf_stamped = tf_buffer_->lookupTransform(
++          target_frame, source_frame,
++          rclcpp::Time(msg->header.stamp),
++          rclcpp::Duration::from_seconds(0.05));
++      tf_ok = true;
++    } catch (const tf2::TransformException &ex) {
++      RCLCPP_WARN_THROTTLE(
++          node_->get_logger(), *node_->get_clock(), 1000,
++          "[GridMap] TF lookup failed (%s -> %s) at stamp: %.3f, err: %s. Fallback to latest.",
++          source_frame.c_str(), target_frame.c_str(),
++          rclcpp::Time(msg->header.stamp).seconds(), ex.what());
++      try {
++        tf_stamped = tf_buffer_->lookupTransform(
++            target_frame, source_frame, tf2::TimePointZero);
++        tf_ok = true;
++      } catch (const tf2::TransformException &ex2) {
++        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                             "[GridMap] TF fallback failed (%s -> %s): %s. Using odom-pose.",
++                             source_frame.c_str(), target_frame.c_str(), ex2.what());
++      }
++    }
++
++    if (tf_ok) {
++      const auto& t = tf_stamped.transform.translation;
++      const auto& r = tf_stamped.transform.rotation;
++      Eigen::Quaternionf q(
++          static_cast<float>(r.w), static_cast<float>(r.x),
++          static_cast<float>(r.y), static_cast<float>(r.z));
++      Eigen::Affine3f T = Eigen::Affine3f::Identity();
++      T.linear() = q.toRotationMatrix();
++      T.translation() = Eigen::Vector3f(
++          static_cast<float>(t.x), static_cast<float>(t.y), static_cast<float>(t.z));
++      pcl::transformPointCloud(cloud_sensor, latest_cloud, T);
++    } else {
++      // TF 완전 실패 시: odom 포즈로 근사 변환
++      Eigen::Affine3f T = Eigen::Affine3f::Identity();
++      T.linear() = md_.camera_r_m_.cast<float>();
++      T.translation() = md_.camera_pos_.cast<float>();
++      pcl::transformPointCloud(cloud_sensor, latest_cloud, T);
++    }
++    latest_cloud.header.frame_id = target_frame;
++
++  } else {
++    // 기존 경로: source==target이거나 sf 비활성화인 경우
++    sensor_msgs::msg::PointCloud2 cloud_map;
++    if (source_frame == target_frame) {
++      cloud_map = *msg;
++    } else {
++      try {
++        auto tf = tf_buffer_->lookupTransform(
++            target_frame, source_frame,
++            rclcpp::Time(msg->header.stamp),
++            rclcpp::Duration::from_seconds(0.0));  // 0ms: 즉시 실패 → TimePointZero로 낙하
++        tf2::doTransform(*msg, cloud_map, tf);
++      } catch (const tf2::TransformException &ex) {
++        RCLCPP_WARN_THROTTLE(
++            node_->get_logger(), *node_->get_clock(), 1000,
++            "[GridMap] TF lookup failed (%s -> %s) at stamp: %.3f, err: %s. Fallback to latest.",
++            source_frame.c_str(), target_frame.c_str(),
++            rclcpp::Time(msg->header.stamp).seconds(), ex.what());
++        try {
++          auto tf_latest = tf_buffer_->lookupTransform(
++              target_frame, source_frame, tf2::TimePointZero);
++          tf2::doTransform(*msg, cloud_map, tf_latest);
++        } catch (const tf2::TransformException &ex2) {
++          if (!md_.has_odom_) {
++            cloud_map = *msg;
++            cloud_map.header.frame_id = target_frame;
++            RCLCPP_WARN_THROTTLE(
++                node_->get_logger(), *node_->get_clock(), 1000,
++                "[GridMap] TF fallback failed (%s -> %s): %s (no odom). Using raw cloud fallback.",
++                source_frame.c_str(), target_frame.c_str(), ex2.what());
++          } else {
++            pcl::PointCloud<pcl::PointXYZ> cloud_src, cloud_fallback;
++            pcl::fromROSMsg(*msg, cloud_src);
++            Eigen::Affine3f T = Eigen::Affine3f::Identity();
++            T.linear() = md_.camera_r_m_.cast<float>();
++            T.translation() = md_.camera_pos_.cast<float>();
++            pcl::transformPointCloud(cloud_src, cloud_fallback, T);
++            pcl::toROSMsg(cloud_fallback, cloud_map);
++            cloud_map.header = msg->header;
++            cloud_map.header.frame_id = target_frame;
++            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++                                 "[GridMap] TF fallback failed (%s -> %s). Using odom-pose cloud fallback.",
++                                 source_frame.c_str(), target_frame.c_str());
++          }
++        }
++      }
++    }
++    pcl::fromROSMsg(cloud_map, latest_cloud);
++    applySectorFilter(latest_cloud);
++  }
++
++  if (latest_cloud.points.empty())
++    return;
++
++  if (!std::isfinite(md_.camera_pos_(0)) ||
++      !std::isfinite(md_.camera_pos_(1)) ||
++      !std::isfinite(md_.camera_pos_(2)))
+     return;
+ 
+-  if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
++  // ---- guard: 파라미터 이상하면 컷 ----
++  if (mp_.resolution_ <= 0.0 ||
++      mp_.local_update_range_.minCoeff() <= 0.0 ||
++      mp_.obstacles_inflation_ <= 0.0) {
++    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++      "[GridMap] invalid params: res=%.3f local=(%.2f,%.2f,%.2f) inflation=%.2f",
++      mp_.resolution_,
++      mp_.local_update_range_.x(), mp_.local_update_range_.y(), mp_.local_update_range_.z(),
++      mp_.obstacles_inflation_);
+     return;
++  }
+ 
++  // local 영역 inflate map 클리어 (sector filter 시 시각화는 publishMapInflate 마스킹이 담당)
+   this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
+                     md_.camera_pos_ + mp_.local_update_range_);
+ 
+-  pcl::PointXYZ pt;
+-  Eigen::Vector3d p3d, p3d_inf;
+-
+-  int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
+-  int inf_step_z = 1;
+-
+-  double max_x, max_y, max_z, min_x, min_y, min_z;
++  // ---- inflation step ----
++  const int inf_step_xy = std::max(1, (int)std::ceil(mp_.obstacles_inflation_ / mp_.resolution_));
++  const int inf_step_z  = 1; // 필요하면 파라미터화
++
++  // offsets 캐시
++  static int last_xy = -1, last_z = -1;
++  static std::vector<Eigen::Vector3i, Eigen::aligned_allocator<Eigen::Vector3i>> offsets;
++  if (inf_step_xy != last_xy || inf_step_z != last_z) {
++    offsets.clear();
++    offsets.reserve((2*inf_step_xy + 1) * (2*inf_step_xy + 1) * (2*inf_step_z + 1));
++    for (int dx = -inf_step_xy; dx <= inf_step_xy; ++dx)
++      for (int dy = -inf_step_xy; dy <= inf_step_xy; ++dy)
++        for (int dz = -inf_step_z; dz <= inf_step_z; ++dz)
++          offsets.emplace_back(dx, dy, dz);
++    last_xy = inf_step_xy;
++    last_z  = inf_step_z;
++  }
+ 
+-  min_x = mp_.map_max_boundary_(0);
+-  min_y = mp_.map_max_boundary_(1);
+-  min_z = mp_.map_max_boundary_(2);
++  // local bound (index 기준)
++  Eigen::Vector3i bound_min = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
++  Eigen::Vector3i bound_max = Eigen::Vector3i::Zero();
++  bool any = false;
++  const double min_keep_dist = std::max(mp_.min_ray_length_, 1.5 * mp_.resolution_);
+ 
+-  max_x = mp_.map_min_boundary_(0);
+-  max_y = mp_.map_min_boundary_(1);
+-  max_z = mp_.map_min_boundary_(2);
++  // camera voxel 포함(항상 publish 범위가 0이 되지 않게)
++  Eigen::Vector3i cam_id;
++  posToIndex(md_.camera_pos_, cam_id);
++  boundIndex(cam_id);
++  bound_min = bound_min.cwiseMin(cam_id);
++  bound_max = bound_max.cwiseMax(cam_id);
+ 
+-  for (size_t i = 0; i < latest_cloud.points.size(); ++i)
++  for (const auto &p : latest_cloud.points)
+   {
+-    pt = latest_cloud.points[i];
+-    p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
+-
+-    /* point inside update range */
+-    Eigen::Vector3d devi = p3d - md_.camera_pos_;
+-    Eigen::Vector3i inf_pt;
+-
+-    if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
+-        fabs(devi(2)) < mp_.local_update_range_(2))
+-    {
+-
+-      /* inflate the point */
+-      // 点云膨胀
+-      for (int x = -inf_step; x <= inf_step; ++x)
+-        for (int y = -inf_step; y <= inf_step; ++y)
+-          for (int z = -inf_step_z; z <= inf_step_z; ++z)
+-          {
++    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
++      continue;
+ 
+-            p3d_inf(0) = pt.x + x * mp_.resolution_;
+-            p3d_inf(1) = pt.y + y * mp_.resolution_;
+-            p3d_inf(2) = pt.z + z * mp_.resolution_;
++    // local update range 필터
++    const double dx = p.x - md_.camera_pos_.x();
++    const double dy = p.y - md_.camera_pos_.y();
++    const double dz = p.z - md_.camera_pos_.z();
++    const double range = std::sqrt(dx * dx + dy * dy + dz * dz);
+ 
+-            max_x = max(max_x, p3d_inf(0));
+-            max_y = max(max_y, p3d_inf(1));
+-            max_z = max(max_z, p3d_inf(2));
++    // Ignore near-field points to avoid self-occupancy around the drone body/sensor.
++    if (range < min_keep_dist)
++      continue;
+ 
+-            min_x = min(min_x, p3d_inf(0));
+-            min_y = min(min_y, p3d_inf(1));
+-            min_z = min(min_z, p3d_inf(2));
++    if (std::fabs(dx) > mp_.local_update_range_.x() ||
++        std::fabs(dy) > mp_.local_update_range_.y() ||
++        std::fabs(dz) > mp_.local_update_range_.z())
++      continue;
+ 
+-            posToIndex(p3d_inf, inf_pt);
++    Eigen::Vector3i base_id;
++    posToIndex(Eigen::Vector3d(p.x, p.y, p.z), base_id);
++    if (!isInMap(base_id))
++      continue;
+ 
+-            if (!isInMap(inf_pt))
+-              continue;
++    any = true;
+ 
+-            int idx_inf = toAddress(inf_pt);
++    bound_min = bound_min.cwiseMin(base_id - Eigen::Vector3i(inf_step_xy, inf_step_xy, inf_step_z));
++    bound_max = bound_max.cwiseMax(base_id + Eigen::Vector3i(inf_step_xy, inf_step_xy, inf_step_z));
+ 
+-            md_.occupancy_buffer_inflate_[idx_inf] = 1;
+-          }
++    for (const auto &off : offsets)
++    {
++      const Eigen::Vector3i id = base_id + off;
++      if (!isInMap(id)) continue;
++      md_.occupancy_buffer_inflate_[toAddress(id)] = 1;
+     }
+   }
+ 
+-  min_x = min(min_x, md_.camera_pos_(0));
+-  min_y = min(min_y, md_.camera_pos_(1));
+-  min_z = min(min_z, md_.camera_pos_(2));
+-
+-  max_x = max(max_x, md_.camera_pos_(0));
+-  max_y = max(max_y, md_.camera_pos_(1));
+-  max_z = max(max_z, md_.camera_pos_(2));
+-
+-  max_z = max(max_z, mp_.ground_height_);
+-
+-  posToIndex(Eigen::Vector3d(max_x, max_y, max_z), md_.local_bound_max_);
+-  posToIndex(Eigen::Vector3d(min_x, min_y, min_z), md_.local_bound_min_);
++  // local bound 확정
++  if (any) {
++    boundIndex(bound_min);
++    boundIndex(bound_max);
++    md_.local_bound_min_ = bound_min;
++    md_.local_bound_max_ = bound_max;
++  } else {
++    md_.local_bound_min_ = cam_id;
++    md_.local_bound_max_ = cam_id;
++  }
+ 
+-  // 更新局部地图边界
+-  boundIndex(md_.local_bound_min_);
+-  boundIndex(md_.local_bound_max_);
+ 
+-  // add virtual ceiling to limit flight height
+-  // 添加虚拟天花板控制飞行高度
++  // virtual ceiling
+   if (mp_.virtual_ceil_height_ > -0.5) {
+-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
+-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
+-      }
++    int ceil_id =
++        (int)std::floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
++
++    if (ceil_id >= 0 && ceil_id < mp_.map_voxel_num_(2)) {
++      for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
++        for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
++          md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
++    }
+   }
++
++  // LiDAR 데이터 처리 즉시 grid 발행 → vis_timer_ 지연 없이 points와 동기화
++  publishMapInflate(true);
+ }
+ 
+ void GridMap::publishMap()
+@@ -942,7 +1543,8 @@ void GridMap::publishMap()
+ 
+         Eigen::Vector3d pos;
+         indexToPos(Eigen::Vector3i(x, y, z), pos);
+-        if (pos(2) > mp_.visualization_truncate_height_)
++        if (mp_.visualization_truncate_height_ > mp_.map_min_boundary_(2) &&
++            pos(2) > mp_.visualization_truncate_height_)
+           continue;
+ 
+         pt.x = pos(0);
+@@ -958,6 +1560,8 @@ void GridMap::publishMap()
+   sensor_msgs::msg::PointCloud2 cloud_msg;
+ 
+   pcl::toROSMsg(cloud, cloud_msg);
++  cloud_msg.header.stamp = node_->now();
++  cloud_msg.header.frame_id = mp_.frame_id_;
+   map_pub_->publish(cloud_msg);
+ }
+ 
+@@ -983,6 +1587,14 @@ void GridMap::publishMapInflate(bool all_info)
+   boundIndex(min_cut);
+   boundIndex(max_cut);
+ 
++  // sector filter 시각화 마스킹: full-view recovery 중에는 마스킹 해제
++  const int vis_frames_left = sf_full_view_frames_remaining_.load();
++  const bool vis_in_full_view = sf_adaptive_recovery_ &&
++      ((node_->now() < sf_force_full_view_until_) || (vis_frames_left > 0));
++  const bool vis_sector_mask = sf_enable_ && md_.has_odom_ && !vis_in_full_view;
++  Eigen::Matrix3d cam_r_inv;
++  if (vis_sector_mask) cam_r_inv = md_.camera_r_m_.transpose();
++
+   for (int x = min_cut(0); x <= max_cut(0); ++x)
+     for (int y = min_cut(1); y <= max_cut(1); ++y)
+       for (int z = min_cut(2); z <= max_cut(2); ++z)
+@@ -992,9 +1604,17 @@ void GridMap::publishMapInflate(bool all_info)
+ 
+         Eigen::Vector3d pos;
+         indexToPos(Eigen::Vector3i(x, y, z), pos);
+-        if (pos(2) > mp_.visualization_truncate_height_)
++        if (mp_.visualization_truncate_height_ > mp_.map_min_boundary_(2) &&
++            pos(2) > mp_.visualization_truncate_height_)
+           continue;
+ 
++        if (vis_sector_mask) {
++          // world frame 벡터를 드론 local frame으로 변환하여 수평 각도 계산
++          Eigen::Vector3d local_dir = cam_r_inv * (pos - md_.camera_pos_);
++          const double ang = std::atan2(local_dir(1), local_dir(0));
++          if (ang < sf_min_angle_rad_ || ang > sf_max_angle_rad_) continue;
++        }
++
+         pt.x = pos(0);
+         pt.y = pos(1);
+         pt.z = pos(2);
+@@ -1008,6 +1628,8 @@ void GridMap::publishMapInflate(bool all_info)
+   sensor_msgs::msg::PointCloud2 cloud_msg;
+ 
+   pcl::toROSMsg(cloud, cloud_msg);
++  cloud_msg.header.stamp = node_->now();
++  cloud_msg.header.frame_id = mp_.frame_id_;
+   map_inf_pub_->publish(cloud_msg);
+ 
+   // RCLCPP_INFO(rclcpp::get_logger("publishMapInflate"), "pub map");
+@@ -1028,7 +1650,8 @@ void GridMap::getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size)
+   ori = mp_.map_origin_, size = mp_.map_size_;
+ }
+ 
+-void GridMap::extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom)
++void GridMap::extrinsicCallback(
++  const nav_msgs::msg::Odometry::ConstSharedPtr odom)
+ {
+   Eigen::Quaterniond cam2body_q = Eigen::Quaterniond(odom->pose.pose.orientation.w,
+                                                      odom->pose.pose.orientation.x,
+@@ -1042,21 +1665,71 @@ void GridMap::extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom)
+   md_.cam2body_(3, 3) = 1.0;
+ }
+ 
+-void GridMap::depthOdomCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+-                                const nav_msgs::msg::Odometry::ConstPtr &odom)
++void GridMap::depthOdomCallback(
++  const sensor_msgs::msg::Image::ConstSharedPtr img,
++  const nav_msgs::msg::Odometry::ConstSharedPtr odom)
+ {
+-  /* get pose */
+-  Eigen::Quaterniond body_q = Eigen::Quaterniond(odom->pose.pose.orientation.w,
+-                                                 odom->pose.pose.orientation.x,
+-                                                 odom->pose.pose.orientation.y,
+-                                                 odom->pose.pose.orientation.z);
+-  Eigen::Matrix3d body_r_m = body_q.toRotationMatrix();
+-  Eigen::Matrix4d body2world;
+-  body2world.block<3, 3>(0, 0) = body_r_m;
+-  body2world(0, 3) = odom->pose.pose.position.x;
+-  body2world(1, 3) = odom->pose.pose.position.y;
+-  body2world(2, 3) = odom->pose.pose.position.z;
+-  body2world(3, 3) = 1.0;
++  md_.last_occ_update_time_ = node_->now();
++  md_.flag_depth_odom_timeout_ = false;
++
++  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++    "[GridMap] depthOdom cb alive enc=%s size=%ux%u odom_frame=%s",
++    img->encoding.c_str(), img->width, img->height,
++    odom->header.frame_id.c_str());
++  
++    /* get pose */
++  // --- (교체) odom pose를 mp_.frame_id_로 변환해서 body2world 생성 ---
++  const std::string target_frame = mp_.frame_id_;        // 보통 "map"
++  const std::string source_frame = odom->header.frame_id; // 보통 "odom"
++
++  geometry_msgs::msg::PoseStamped body_in, body_out;
++  body_in.header = odom->header;
++  body_in.pose   = odom->pose.pose;
++
++  if (source_frame.empty()) {
++    RCLCPP_WARN(node_->get_logger(), "[GridMap] depthOdom: odom frame_id empty, skip");
++    return;
++  }
++
++  if (source_frame == target_frame) {
++    body_out = body_in;
++  } else {
++    try {
++      auto tf = tf_buffer_->lookupTransform(
++          target_frame, source_frame,
++          rclcpp::Time(odom->header.stamp),
++          rclcpp::Duration::from_seconds(0.05));
++      tf2::doTransform(body_in, body_out, tf);
++    } catch (const tf2::TransformException &ex) {
++      RCLCPP_WARN_THROTTLE(
++        node_->get_logger(), *node_->get_clock(), 2000,
++        "[GridMap] depthOdom TF lookup failed (%s->%s) stamp=%.3f err=%s. Fallback latest.",
++        source_frame.c_str(), target_frame.c_str(),
++        rclcpp::Time(odom->header.stamp).seconds(), ex.what());
++      try {
++        auto tf_latest = tf_buffer_->lookupTransform(target_frame, source_frame, tf2::TimePointZero);
++        tf2::doTransform(body_in, body_out, tf_latest);
++      } catch (const tf2::TransformException &ex2) {
++        // Keep depth fusion alive with raw odom pose fallback.
++        body_out = body_in;
++        RCLCPP_WARN_THROTTLE(
++          node_->get_logger(), *node_->get_clock(), 2000,
++          "[GridMap] depthOdom TF fallback failed (%s->%s): %s. Using raw odom pose.",
++          source_frame.c_str(), target_frame.c_str(), ex2.what());
++      }
++    }
++  }
++
++  Eigen::Quaterniond body_q(body_out.pose.orientation.w,
++                            body_out.pose.orientation.x,
++                            body_out.pose.orientation.y,
++                            body_out.pose.orientation.z);
++
++  Eigen::Matrix4d body2world = Eigen::Matrix4d::Identity();
++  body2world.block<3,3>(0,0) = body_q.toRotationMatrix();
++  body2world(0,3) = body_out.pose.position.x;
++  body2world(1,3) = body_out.pose.position.y;
++  body2world(2,3) = body_out.pose.position.z;
+ 
+   Eigen::Matrix4d cam_T = body2world * md_.cam2body_;
+   md_.camera_pos_(0) = cam_T(0, 3);
+@@ -1069,10 +1742,28 @@ void GridMap::depthOdomCallback(const sensor_msgs::msg::Image::ConstPtr &img,
+   cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
+   if (img->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
+   {
+-    (cv_ptr->image).convertTo(cv_ptr->image, CV_16UC1, mp_.k_depth_scaling_factor_);
++    double scale = mp_.k_depth_scaling_factor_;
++    if (scale <= 0.0) scale = 1000.0;
++    cv_ptr->image.convertTo(cv_ptr->image, CV_16UC1, scale);
+   }
+   cv_ptr->image.copyTo(md_.depth_image_);
+ 
+-  md_.occ_need_update_ = true;
+   md_.flag_use_depth_fusion = true;
+-}
+\ No newline at end of file
++
++  // ✅ pose가 들어왔으니 odom 유효
++  md_.has_odom_ = true;
++
++  // ✅ map 업데이트 트리거 (맵 안에 있을 때만)
++  const bool in_map = isInMap(md_.camera_pos_);
++  if (in_map) {
++    md_.update_num_ += 1;
++    md_.occ_need_update_ = true;
++  } else {
++    md_.occ_need_update_ = false;
++  }
++
++  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
++    "[GridMap] depthOdom fused cam=(%.2f %.2f %.2f) in_map=%d occ_need_update=%d",
++    md_.camera_pos_.x(), md_.camera_pos_.y(), md_.camera_pos_.z(),
++    (int)in_map, (int)md_.occ_need_update_);
++}
+diff --git a/src/planner/plan_manage/CMakeLists.txt b/src/planner/plan_manage/CMakeLists.txt
+index f90cbfd..e089790 100755
+--- a/src/planner/plan_manage/CMakeLists.txt
++++ b/src/planner/plan_manage/CMakeLists.txt
+@@ -15,6 +15,7 @@ endif()
+ find_package(ament_cmake REQUIRED)
+ find_package(rclcpp REQUIRED)
+ find_package(geometry_msgs REQUIRED)
++find_package(std_msgs REQUIRED)
+ find_package(quadrotor_msgs REQUIRED)
+ find_package(visualization_msgs REQUIRED)
+ find_package(nav_msgs REQUIRED)
+@@ -58,7 +59,7 @@ add_executable(ego_planner_node
+ # )
+ 
+ ament_target_dependencies(ego_planner_node 
+-                          rclcpp nav_msgs visualization_msgs 
++                          rclcpp nav_msgs visualization_msgs std_msgs
+                           geometry_msgs quadrotor_msgs 
+                           plan_env path_searching 
+                           bspline_opt traj_utils 
+diff --git a/src/planner/plan_manage/include/ego_planner/ego_replan_fsm.h b/src/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+index ed91462..644da8f 100755
+--- a/src/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
++++ b/src/planner/plan_manage/include/ego_planner/ego_replan_fsm.h
+@@ -9,6 +9,7 @@
+ #include "sensor_msgs/msg/imu.hpp"
+ #include "rclcpp/rclcpp.hpp"
+ #include "std_msgs/msg/empty.hpp"
++#include "std_msgs/msg/bool.hpp"
+ #include <vector>
+ #include "visualization_msgs/msg/marker.hpp"
+ 
+@@ -63,6 +64,11 @@ namespace ego_planner
+     double emergency_time_;
+     bool flag_realworld_experiment_;
+     bool enable_fail_safe_;
++    double z_max_;
++    bool backoff_enable_;
++    double backoff_dist_;
++    double backoff_cooldown_sec_;
++    rclcpp::Time last_backoff_time_;
+ 
+     /* planning data */
+     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
+@@ -94,6 +100,8 @@ namespace ego_planner
+     // rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr new_pub_;
+     rclcpp::Publisher<traj_utils::msg::Bspline>::SharedPtr bspline_pub_;
+     rclcpp::Publisher<traj_utils::msg::DataDisp>::SharedPtr data_disp_pub_;
++    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr replan_attempt_pub_;
++    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr replan_status_pub_;
+     rclcpp::Publisher<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_pub_;
+     rclcpp::Publisher<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_pub_;
+ 
+@@ -111,6 +119,7 @@ namespace ego_planner
+     void readGivenWps();
+     void planNextWaypoint(const Eigen::Vector3d next_wp);
+     void getLocalTarget();
++    bool tryBackoffReplan();
+ 
+     /* ROS functions */
+     void execFSMCallback();
+@@ -139,4 +148,4 @@ namespace ego_planner
+ 
+ } // namespace ego_planner
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/planner/plan_manage/launch/advanced_param.launch.py b/src/planner/plan_manage/launch/advanced_param.launch.py
+index 3f68e46..3918589 100755
+--- a/src/planner/plan_manage/launch/advanced_param.launch.py
++++ b/src/planner/plan_manage/launch/advanced_param.launch.py
+@@ -14,16 +14,42 @@ def generate_launch_description():
+     camera_pose_topic = LaunchConfiguration('camera_pose_topic', default='camera_pose')
+     depth_topic = LaunchConfiguration('depth_topic', default='depth_image')
+     cloud_topic = LaunchConfiguration('cloud_topic', default='cloud')
+-    
++    grid_occ_topic = LaunchConfiguration('grid_occ_topic', default='grid/grid_map/occupancy_inflate')
++    grid_pose_type = LaunchConfiguration('grid_pose_type', default=2)
++    grid_frame_id = LaunchConfiguration('grid_frame_id', default='world')
++    grid_obstacles_inflation = LaunchConfiguration('grid_obstacles_inflation', default=0.40)
++    grid_min_ray_length = LaunchConfiguration('grid_min_ray_length', default=0.20)
++    grid_resolution = LaunchConfiguration('grid_resolution', default=0.15)
++    sector_filter_enable = LaunchConfiguration('sector_filter_enable', default='false')
++    sector_min_angle_deg = LaunchConfiguration('sector_min_angle_deg', default=-60.0)
++    sector_max_angle_deg = LaunchConfiguration('sector_max_angle_deg', default=60.0)
++    sector_use_stride = LaunchConfiguration('sector_use_stride', default='false')
++    sector_stride = LaunchConfiguration('sector_stride', default=1)
++    sector_use_voxel = LaunchConfiguration('sector_use_voxel', default='false')
++    sector_voxel_leaf = LaunchConfiguration('sector_voxel_leaf', default=0.10)
++    sector_adaptive_recovery = LaunchConfiguration('sector_adaptive_recovery', default='true')
++    sector_auto_disable_on_front_block = LaunchConfiguration('sector_auto_disable_on_front_block', default='false')
++    sector_full_view_hold_sec = LaunchConfiguration('sector_full_view_hold_sec', default=2.0)
++    virtual_ceil_height = LaunchConfiguration('virtual_ceil_height', default=-0.1)
++    z_max = LaunchConfiguration('z_max', default=2.0)
++    optimization_dist0          = LaunchConfiguration('optimization_dist0',          default=0.32)
++    optimization_lambda_collision= LaunchConfiguration('optimization_lambda_collision',default=2.0)
++    optimization_lambda_smooth   = LaunchConfiguration('optimization_lambda_smooth',   default=1.0)
++    optimization_lambda_feasibility= LaunchConfiguration('optimization_lambda_feasibility', default=0.1)
++    local_update_range_x = LaunchConfiguration('local_update_range_x', default=8.0)
++    local_update_range_y = LaunchConfiguration('local_update_range_y', default=8.0)
++    local_update_range_z = LaunchConfiguration('local_update_range_z', default=4.5)
++    thresh_replan_time    = LaunchConfiguration('thresh_replan_time',    default=1.0)
++    thresh_no_replan_meter= LaunchConfiguration('thresh_no_replan_meter',default=1.0)
+     cx = LaunchConfiguration('cx', default=321.04638671875)
+     cy = LaunchConfiguration('cy', default=243.44969177246094)
+     fx = LaunchConfiguration('fx', default=387.229248046875)
+     fy = LaunchConfiguration('fy', default=387.229248046875)
+     
+-    max_vel = LaunchConfiguration('max_vel', default=2.0)
++    max_vel = LaunchConfiguration('max_vel', default=1.5)
+     max_acc = LaunchConfiguration('max_acc', default=3.0)
+     planning_horizon = LaunchConfiguration('planning_horizon', default=7.5)
+-    
++
+     point_num = LaunchConfiguration('point_num', default=1)
+     point0_x = LaunchConfiguration('point0_x', default=0.0)
+     point0_y = LaunchConfiguration('point0_y', default=0.0)
+@@ -47,6 +73,7 @@ def generate_launch_description():
+     obj_num_set = LaunchConfiguration('obj_num_set', default=10)
+     
+     drone_id = LaunchConfiguration('drone_id', default=0)
++    use_sim_time = LaunchConfiguration('use_sim_time', default='false')
+ 
+     # DeclareLaunchArguments
+     map_size_x_arg = DeclareLaunchArgument('map_size_x_', default_value=map_size_x, description='Map size along X')
+@@ -56,6 +83,136 @@ def generate_launch_description():
+     camera_pose_topic_arg = DeclareLaunchArgument('camera_pose_topic', default_value=camera_pose_topic, description='Camera pose topic')
+     depth_topic_arg = DeclareLaunchArgument('depth_topic', default_value=depth_topic, description='Depth topic')
+     cloud_topic_arg = DeclareLaunchArgument('cloud_topic', default_value=cloud_topic, description='Point cloud topic')
++    grid_occ_topic_arg = DeclareLaunchArgument(
++        'grid_occ_topic',
++        default_value=grid_occ_topic,
++        description='Remapped grid_map/occupancy_inflate topic'
++    )
++    grid_pose_type_arg = DeclareLaunchArgument(
++        'grid_pose_type',
++        default_value=grid_pose_type,
++        description='grid_map pose_type: 1=PoseStamped, 2=Odometry'
++    )
++    grid_frame_id_arg = DeclareLaunchArgument(
++        'grid_frame_id',
++        default_value=grid_frame_id,
++        description='Target frame id used by grid_map'
++    )
++    grid_obstacles_inflation_arg = DeclareLaunchArgument(
++        'grid_obstacles_inflation',
++        default_value=grid_obstacles_inflation,
++        description='Obstacle inflation radius for grid map'
++    )
++    grid_min_ray_length_arg = DeclareLaunchArgument(
++        'grid_min_ray_length',
++        default_value=grid_min_ray_length,
++        description='Minimum range kept from sensor origin'
++    )
++    grid_resolution_arg = DeclareLaunchArgument(
++        'grid_resolution',
++        default_value=grid_resolution,
++        description='Grid map voxel resolution'
++    )
++    sector_filter_enable_arg = DeclareLaunchArgument(
++        'sector_filter_enable',
++        default_value=sector_filter_enable,
++        description='Enable embedded sector filter inside ego_planner_node'
++    )
++    sector_min_angle_deg_arg = DeclareLaunchArgument(
++        'sector_min_angle_deg',
++        default_value=sector_min_angle_deg,
++        description='Embedded sector filter min angle in degree'
++    )
++    sector_max_angle_deg_arg = DeclareLaunchArgument(
++        'sector_max_angle_deg',
++        default_value=sector_max_angle_deg,
++        description='Embedded sector filter max angle in degree'
++    )
++    sector_use_stride_arg = DeclareLaunchArgument(
++        'sector_use_stride',
++        default_value=sector_use_stride,
++        description='Embedded sector filter stride sampling on/off'
++    )
++    sector_stride_arg = DeclareLaunchArgument(
++        'sector_stride',
++        default_value=sector_stride,
++        description='Embedded sector filter stride value'
++    )
++    sector_use_voxel_arg = DeclareLaunchArgument(
++        'sector_use_voxel',
++        default_value=sector_use_voxel,
++        description='Embedded sector filter voxel downsample on/off'
++    )
++    sector_voxel_leaf_arg = DeclareLaunchArgument(
++        'sector_voxel_leaf',
++        default_value=sector_voxel_leaf,
++        description='Embedded sector filter voxel leaf size'
++    )
++    sector_adaptive_recovery_arg = DeclareLaunchArgument(
++        'sector_adaptive_recovery',
++        default_value=sector_adaptive_recovery,
++        description='Embedded sector filter adaptive full-view recovery on/off'
++    )
++    sector_auto_disable_on_front_block_arg = DeclareLaunchArgument(
++        'sector_auto_disable_on_front_block',
++        default_value=sector_auto_disable_on_front_block,
++        description='Trigger full-view when front is blocked by obstacles'
++    )
++    sector_full_view_hold_sec_arg = DeclareLaunchArgument(
++        'sector_full_view_hold_sec',
++        default_value=sector_full_view_hold_sec,
++        description='How long (sec) to hold full-view after recovery trigger'
++    )
++    virtual_ceil_height_arg = DeclareLaunchArgument(
++        'virtual_ceil_height',
++        default_value=virtual_ceil_height,
++        description='Virtual ceiling height [m] (set -0.1 to disable)'
++    )
++    z_max_arg = DeclareLaunchArgument(
++        'z_max',
++        default_value=z_max,
++        description='Max flight altitude [m] applied at FSM and traj_server (set -1 to disable)'
++    )
++    optimization_dist0_arg = DeclareLaunchArgument(
++        'optimization_dist0',
++        default_value=optimization_dist0,
++        description='Optimizer clearance distance (smaller = narrower passages allowed)'
++    )
++    optimization_lambda_collision_arg = DeclareLaunchArgument(
++        'optimization_lambda_collision',
++        default_value=optimization_lambda_collision,
++        description='Collision avoidance cost weight (higher = safer, may sacrifice smoothness)'
++    )
++    optimization_lambda_smooth_arg = DeclareLaunchArgument(
++        'optimization_lambda_smooth',
++        default_value=optimization_lambda_smooth,
++        description='Smoothness cost weight'
++    )
++    optimization_lambda_feasibility_arg = DeclareLaunchArgument(
++        'optimization_lambda_feasibility',
++        default_value=optimization_lambda_feasibility,
++        description='Feasibility (vel/acc limit) cost weight'
++    )
++    local_update_range_x_arg = DeclareLaunchArgument(
++        'local_update_range_x', default_value=local_update_range_x,
++        description='Grid map local update range in X [m]'
++    )
++    local_update_range_y_arg = DeclareLaunchArgument(
++        'local_update_range_y', default_value=local_update_range_y,
++        description='Grid map local update range in Y [m]'
++    )
++    local_update_range_z_arg = DeclareLaunchArgument(
++        'local_update_range_z', default_value=local_update_range_z,
++        description='Grid map local update range in Z [m]'
++    )
++    thresh_replan_time_arg = DeclareLaunchArgument(
++        'thresh_replan_time', default_value=thresh_replan_time,
++        description='FSM replan time threshold [s]'
++    )
++    thresh_no_replan_meter_arg = DeclareLaunchArgument(
++        'thresh_no_replan_meter', default_value=thresh_no_replan_meter,
++        description='FSM no-replan distance threshold [m]'
++    )
+     cx_arg = DeclareLaunchArgument('cx', default_value=cx, description='Camera intrinsic cx')
+     cy_arg = DeclareLaunchArgument('cy', default_value=cy, description='Camera intrinsic cy')
+     fx_arg = DeclareLaunchArgument('fx', default_value=fx, description='Camera intrinsic fx')
+@@ -63,7 +220,7 @@ def generate_launch_description():
+     max_vel_arg = DeclareLaunchArgument('max_vel', default_value=max_vel, description='Maximum velocity')
+     max_acc_arg = DeclareLaunchArgument('max_acc', default_value=max_acc, description='Maximum acceleration')
+     planning_horizon_arg = DeclareLaunchArgument('planning_horizon', default_value=planning_horizon, description='Planning horizon')
+-    
++
+     point_num_arg = DeclareLaunchArgument('point_num', default_value=point_num, description='Number of waypoints')
+     point0_x_arg = DeclareLaunchArgument('point0_x', default_value=point0_x, description='Waypoint 0 X coordinate')
+     point0_y_arg = DeclareLaunchArgument('point0_y', default_value=point0_y, description='Waypoint 0 Y coordinate')
+@@ -85,41 +242,46 @@ def generate_launch_description():
+     use_distinctive_trajs_arg = DeclareLaunchArgument('use_distinctive_trajs', default_value=use_distinctive_trajs, description='Use distinctive trajectories')
+     obj_num_set_arg = DeclareLaunchArgument('obj_num_set', default_value=obj_num_set, description='Number of objects')
+     drone_id_arg = DeclareLaunchArgument('drone_id', default_value=drone_id, description='Drone ID')
++    use_sim_time_arg = DeclareLaunchArgument('use_sim_time', default_value=use_sim_time, description='Use simulation time')
+ 
+     # Ego Planner Node
+     ego_planner_node = Node(
+         package='ego_planner',
+         executable='ego_planner_node',
+-        name=['drone_', drone_id, '_ego_planner_node'],
++        name=['_ego_planner_node'],
++        respawn=True,
++        respawn_delay=2.0,
+         output='screen',
+         remappings=[
+-            ('odom_world', ['drone_', drone_id, '_', odometry_topic]),
+-            ('planning/bspline', ['drone_', drone_id, '_planning/bspline']),
+-            ('planning/data_display', ['drone_', drone_id, '_planning/data_display']),
++            ('odom_world', [odometry_topic]),
++            ('planning/bspline', ['planning/bspline']),
++            ('planning/data_display', ['planning/data_display']),
+             ('planning/broadcast_bspline_from_planner', '/broadcast_bspline'),
+             ('planning/broadcast_bspline_to_planner', '/broadcast_bspline'),
+             
+-            ('goal_point', ['drone_', drone_id, '_plan_vis/goal_point']),
+-            ('global_list', ['drone_', drone_id, '_plan_vis/global_list']),
+-            ('init_list', ['drone_', drone_id, '_plan_vis/init_list']),
+-            ('optimal_list', ['drone_', drone_id, '_plan_vis/optimal_list']),
+-            ('a_star_list', ['drone_', drone_id, '_plan_vis/a_star_list']),
++            ('goal_point', ['plan_vis/goal_point']),
++            ('global_list', ['plan_vis/global_list']),
++            ('init_list', ['plan_vis/init_list']),
++            ('optimal_list', ['plan_vis/optimal_list']),
++            ('a_star_list', ['plan_vis/a_star_list']),
+             
+-            ('grid_map/odom', ['drone_', drone_id, '_', odometry_topic]),
+-            ('grid_map/cloud', ['drone_', drone_id, '_', cloud_topic]),
+-            ('grid_map/pose', ['drone_', drone_id, '_', camera_pose_topic]),
+-            ('grid_map/depth', ['drone_', drone_id, '_', depth_topic]),
+-            ('grid_map/occupancy_inflate', ['drone_', drone_id, '_grid/grid_map/occupancy_inflate'])
++            ('grid_map/odom', [odometry_topic]),
++            ('grid_map/cloud', [cloud_topic]),
++            ('grid_map/pose', [camera_pose_topic]),
++            ('grid_map/depth', [depth_topic]),
++            ('grid_map/occupancy_inflate', [grid_occ_topic])
+         ],
+         parameters=[
++            {'use_sim_time': use_sim_time},
+             {'fsm/flight_type': flight_type},
+-            {'fsm/thresh_replan_time': 1.0},
+-            {'fsm/thresh_no_replan_meter': 1.0},
++            {'fsm/thresh_replan_time': thresh_replan_time},
++            {'fsm/thresh_no_replan_meter': thresh_no_replan_meter},
+             {'fsm/planning_horizon': planning_horizon},
+             {'fsm/planning_horizen_time': 3.0},
+             {'fsm/emergency_time': 1.0},
+-            {'fsm/realworld_experiment': False},
++            {'fsm/realworld_experiment': True},
+             {'fsm/fail_safe': True},
++            {'fsm/z_max': z_max},
+             
+             {'fsm/waypoint_num': point_num},
+             {'fsm/waypoint0_x': point0_x},
+@@ -138,16 +300,16 @@ def generate_launch_description():
+             {'fsm/waypoint4_y': point4_y},
+             {'fsm/waypoint4_z': point4_z},
+             
+-            {'grid_map/resolution': 0.1},
++            {'grid_map/resolution': grid_resolution},
+             {'grid_map/map_size_x': map_size_x},
+             {'grid_map/map_size_y': map_size_y},
+             {'grid_map/map_size_z': map_size_z},
+-            {'grid_map/local_update_range_x': 5.5},
+-            {'grid_map/local_update_range_y': 5.5},
+-            {'grid_map/local_update_range_z': 4.5},
+-            {'grid_map/obstacles_inflation': 0.099},
++            {'grid_map/local_update_range_x': local_update_range_x},
++            {'grid_map/local_update_range_y': local_update_range_y},
++            {'grid_map/local_update_range_z': local_update_range_z},
++            {'grid_map/obstacles_inflation': grid_obstacles_inflation},
+             {'grid_map/local_map_margin': 10},
+-            {'grid_map/ground_height': -0.01},
++            {'grid_map/ground_height': 0.1},
+             # camera parameter
+             {'grid_map/cx': cx},
+             {'grid_map/cy': cy},
+@@ -167,14 +329,24 @@ def generate_launch_description():
+             {'grid_map/p_min': 0.12},
+             {'grid_map/p_max': 0.90},
+             {'grid_map/p_occ': 0.80},
+-            {'grid_map/min_ray_length': 0.1},
+-            {'grid_map/max_ray_length': 4.5},
++            {'grid_map/min_ray_length': grid_min_ray_length},
++            {'grid_map/max_ray_length': 5.0},
++            {'grid_map/sector_filter_enable': sector_filter_enable},
++            {'grid_map/sector_min_angle_deg': sector_min_angle_deg},
++            {'grid_map/sector_max_angle_deg': sector_max_angle_deg},
++            {'grid_map/sector_use_stride': sector_use_stride},
++            {'grid_map/sector_stride': sector_stride},
++            {'grid_map/sector_use_voxel': sector_use_voxel},
++            {'grid_map/sector_voxel_leaf': sector_voxel_leaf},
++            {'grid_map/sector_adaptive_recovery': sector_adaptive_recovery},
++            {'grid_map/sector_auto_disable_on_front_block': sector_auto_disable_on_front_block},
++            {'grid_map/sector_full_view_hold_sec': sector_full_view_hold_sec},
+             
+-            {'grid_map/virtual_ceil_height': 2.9},
++            {'grid_map/virtual_ceil_height': virtual_ceil_height},
+             {'grid_map/visualization_truncate_height': 1.8},
+             {'grid_map/show_occ_time': False},
+-            {'grid_map/pose_type': 1},
+-            {'grid_map/frame_id': "world"},
++            {'grid_map/pose_type': grid_pose_type},
++            {'grid_map/frame_id': grid_frame_id},
+             # planner manager
+             {'manager/max_vel': max_vel},
+             {'manager/max_acc': max_acc},
+@@ -185,11 +357,11 @@ def generate_launch_description():
+             {'manager/use_distinctive_trajs': use_distinctive_trajs},
+             {'manager/drone_id': drone_id},
+             # Trajectory optimization parameters
+-            {'optimization/lambda_smooth': 1.0},
+-            {'optimization/lambda_collision': 0.5},
+-            {'optimization/lambda_feasibility': 0.1},
++            {'optimization/lambda_smooth': optimization_lambda_smooth},
++            {'optimization/lambda_collision': optimization_lambda_collision},
++            {'optimization/lambda_feasibility': optimization_lambda_feasibility},
+             {'optimization/lambda_fitness': 1.0},
+-            {'optimization/dist0': 0.5},
++            {'optimization/dist0': optimization_dist0},
+             {'optimization/swarm_clearance': 0.5},
+             {'optimization/max_vel': max_vel},
+             {'optimization/max_acc': max_acc},
+@@ -217,6 +389,33 @@ def generate_launch_description():
+     ld.add_action(camera_pose_topic_arg)
+     ld.add_action(depth_topic_arg)
+     ld.add_action(cloud_topic_arg)
++    ld.add_action(grid_occ_topic_arg)
++    ld.add_action(grid_pose_type_arg)
++    ld.add_action(grid_frame_id_arg)
++    ld.add_action(grid_obstacles_inflation_arg)
++    ld.add_action(grid_min_ray_length_arg)
++    ld.add_action(grid_resolution_arg)
++    ld.add_action(sector_filter_enable_arg)
++    ld.add_action(sector_min_angle_deg_arg)
++    ld.add_action(sector_max_angle_deg_arg)
++    ld.add_action(sector_use_stride_arg)
++    ld.add_action(sector_stride_arg)
++    ld.add_action(sector_use_voxel_arg)
++    ld.add_action(sector_voxel_leaf_arg)
++    ld.add_action(sector_adaptive_recovery_arg)
++    ld.add_action(sector_auto_disable_on_front_block_arg)
++    ld.add_action(sector_full_view_hold_sec_arg)
++    ld.add_action(virtual_ceil_height_arg)
++    ld.add_action(z_max_arg)
++    ld.add_action(optimization_dist0_arg)
++    ld.add_action(optimization_lambda_collision_arg)
++    ld.add_action(optimization_lambda_smooth_arg)
++    ld.add_action(optimization_lambda_feasibility_arg)
++    ld.add_action(local_update_range_x_arg)
++    ld.add_action(local_update_range_y_arg)
++    ld.add_action(local_update_range_z_arg)
++    ld.add_action(thresh_replan_time_arg)
++    ld.add_action(thresh_no_replan_meter_arg)
+     ld.add_action(cx_arg)
+     ld.add_action(cy_arg)
+     ld.add_action(fx_arg)
+@@ -224,7 +423,7 @@ def generate_launch_description():
+     ld.add_action(max_vel_arg)
+     ld.add_action(max_acc_arg)
+     ld.add_action(planning_horizon_arg)
+-    
++
+     ld.add_action(point_num_arg)
+     ld.add_action(point0_x_arg)
+     ld.add_action(point0_y_arg)
+@@ -246,6 +445,7 @@ def generate_launch_description():
+     ld.add_action(use_distinctive_trajs_arg)
+     ld.add_action(obj_num_set_arg)
+     ld.add_action(drone_id_arg)
++    ld.add_action(use_sim_time_arg)
+ 
+ 
+     # Add Node
+diff --git a/src/planner/plan_manage/launch/run_in_sim.launch.py b/src/planner/plan_manage/launch/run_in_sim.launch.py
+index aea76ce..ef22191 100755
+--- a/src/planner/plan_manage/launch/run_in_sim.launch.py
++++ b/src/planner/plan_manage/launch/run_in_sim.launch.py
+@@ -20,6 +20,22 @@ def generate_launch_description():
+     drone_id = LaunchConfiguration('drone_id', default=0)
+     odom_topic = LaunchConfiguration('odom_topic', default='visual_slam/odom')
+     obj_num = LaunchConfiguration('obj_num', default=10)
++    sector_filter_enable = LaunchConfiguration('sector_filter_enable', default='false')
++    sector_min_angle_deg = LaunchConfiguration('sector_min_angle_deg', default=-75.0)
++    sector_max_angle_deg = LaunchConfiguration('sector_max_angle_deg', default=75.0)
++    sector_use_stride = LaunchConfiguration('sector_use_stride', default='false')
++    sector_stride = LaunchConfiguration('sector_stride', default=1)
++    sector_use_voxel = LaunchConfiguration('sector_use_voxel', default='false')
++    sector_voxel_leaf = LaunchConfiguration('sector_voxel_leaf', default=0.10)
++    sector_adaptive_recovery = LaunchConfiguration('sector_adaptive_recovery', default='true')
++    backoff_enable        = LaunchConfiguration('backoff_enable',        default='true')
++    backoff_dist          = LaunchConfiguration('backoff_dist',          default=1.2)
++    backoff_cooldown_sec  = LaunchConfiguration('backoff_cooldown_sec',  default=2.0)
++    local_update_range_x  = LaunchConfiguration('local_update_range_x',   default=6.5)
++    local_update_range_y  = LaunchConfiguration('local_update_range_y',   default=6.5)
++    local_update_range_z  = LaunchConfiguration('local_update_range_z',   default=4.5)
++    thresh_replan_time    = LaunchConfiguration('thresh_replan_time',     default=1.0)
++    thresh_no_replan_meter= LaunchConfiguration('thresh_no_replan_meter', default=1.0)
+ 
+     # DeclareLaunchArgument definitions
+     map_size_x_cmd = DeclareLaunchArgument('map_size_x', default_value=map_size_x, description='Map size along x')
+@@ -34,6 +50,70 @@ def generate_launch_description():
+     drone_id_cmd = DeclareLaunchArgument('drone_id', default_value=drone_id, description='ID of the drone')
+     odom_topic_cmd = DeclareLaunchArgument('odom_topic', default_value=odom_topic, description='Odometry topic')
+     obj_num_cmd = DeclareLaunchArgument('obj_num', default_value=obj_num, description='Number of moving objects')
++    sector_filter_enable_cmd = DeclareLaunchArgument(
++        'sector_filter_enable', default_value=sector_filter_enable,
++        description='Enable embedded sector filter inside ego_planner_node'
++    )
++    sector_min_angle_deg_cmd = DeclareLaunchArgument(
++        'sector_min_angle_deg', default_value=sector_min_angle_deg,
++        description='Embedded sector filter min angle in degree'
++    )
++    sector_max_angle_deg_cmd = DeclareLaunchArgument(
++        'sector_max_angle_deg', default_value=sector_max_angle_deg,
++        description='Embedded sector filter max angle in degree'
++    )
++    sector_use_stride_cmd = DeclareLaunchArgument(
++        'sector_use_stride', default_value=sector_use_stride,
++        description='Embedded sector filter stride sampling on/off'
++    )
++    sector_stride_cmd = DeclareLaunchArgument(
++        'sector_stride', default_value=sector_stride,
++        description='Embedded sector filter stride value'
++    )
++    sector_use_voxel_cmd = DeclareLaunchArgument(
++        'sector_use_voxel', default_value=sector_use_voxel,
++        description='Embedded sector filter voxel downsample on/off'
++    )
++    sector_voxel_leaf_cmd = DeclareLaunchArgument(
++        'sector_voxel_leaf', default_value=sector_voxel_leaf,
++        description='Embedded sector filter voxel leaf size'
++    )
++    sector_adaptive_recovery_cmd = DeclareLaunchArgument(
++        'sector_adaptive_recovery', default_value=sector_adaptive_recovery,
++        description='Embedded sector filter adaptive full-view recovery on/off'
++    )
++    backoff_enable_cmd = DeclareLaunchArgument(
++        'backoff_enable', default_value=backoff_enable,
++        description='Enable backoff replan when overlapping obstacles'
++    )
++    backoff_dist_cmd = DeclareLaunchArgument(
++        'backoff_dist', default_value=backoff_dist,
++        description='Backoff distance (m) when overlapping'
++    )
++    backoff_cooldown_sec_cmd = DeclareLaunchArgument(
++        'backoff_cooldown_sec', default_value=backoff_cooldown_sec,
++        description='Cooldown between backoff attempts (sec)'
++    )
++    local_update_range_x_cmd = DeclareLaunchArgument(
++        'local_update_range_x', default_value=local_update_range_x,
++        description='Grid map local update range in X [m]'
++    )
++    local_update_range_y_cmd = DeclareLaunchArgument(
++        'local_update_range_y', default_value=local_update_range_y,
++        description='Grid map local update range in Y [m]'
++    )
++    local_update_range_z_cmd = DeclareLaunchArgument(
++        'local_update_range_z', default_value=local_update_range_z,
++        description='Grid map local update range in Z [m]'
++    )
++    thresh_replan_time_cmd = DeclareLaunchArgument(
++        'thresh_replan_time', default_value=thresh_replan_time,
++        description='FSM replan time threshold [s]'
++    )
++    thresh_no_replan_meter_cmd = DeclareLaunchArgument(
++        'thresh_no_replan_meter', default_value=thresh_no_replan_meter,
++        description='FSM no-replan distance threshold [m]'
++    )
+ 
+     use_dynamic = LaunchConfiguration('use_dynamic', default=True)  
+     use_dynamic_cmd = DeclareLaunchArgument('use_dynamic', default_value=use_dynamic, description='Use Drone Simulation Considering Dynamics or Not')
+@@ -61,6 +141,22 @@ def generate_launch_description():
+             'planning_horizon': str(7.5),
+             'use_distinctive_trajs': 'True',
+             'flight_type': str(2),
++            'sector_filter_enable': sector_filter_enable,
++            'sector_min_angle_deg': sector_min_angle_deg,
++            'sector_max_angle_deg': sector_max_angle_deg,
++            'sector_use_stride': sector_use_stride,
++            'sector_stride': sector_stride,
++            'sector_use_voxel': sector_use_voxel,
++            'sector_voxel_leaf': sector_voxel_leaf,
++            'sector_adaptive_recovery': sector_adaptive_recovery,
++            'backoff_enable': backoff_enable,
++            'backoff_dist': backoff_dist,
++            'backoff_cooldown_sec': backoff_cooldown_sec,
++            'local_update_range_x': local_update_range_x,
++            'local_update_range_y': local_update_range_y,
++            'local_update_range_z': local_update_range_z,
++            'thresh_replan_time': thresh_replan_time,
++            'thresh_no_replan_meter': thresh_no_replan_meter,
+             'point_num': str(1),
+             'point0_x': target_x,
+             'point0_y': target_y,
+@@ -89,6 +185,8 @@ def generate_launch_description():
+         package='ego_planner',
+         executable='traj_server',
+         name=['drone_', drone_id, '_traj_server'],
++        respawn=True,
++        respawn_delay=2.0,
+         output='screen',
+         remappings=[
+             ('position_cmd', ['drone_', drone_id, '_planning/pos_cmd']),
+@@ -154,6 +252,22 @@ def generate_launch_description():
+     ld.add_action(drone_id_cmd)
+     ld.add_action(odom_topic_cmd)
+     ld.add_action(obj_num_cmd)
++    ld.add_action(sector_filter_enable_cmd)
++    ld.add_action(sector_min_angle_deg_cmd)
++    ld.add_action(sector_max_angle_deg_cmd)
++    ld.add_action(sector_use_stride_cmd)
++    ld.add_action(sector_stride_cmd)
++    ld.add_action(sector_use_voxel_cmd)
++    ld.add_action(sector_voxel_leaf_cmd)
++    ld.add_action(sector_adaptive_recovery_cmd)
++    ld.add_action(backoff_enable_cmd)
++    ld.add_action(backoff_dist_cmd)
++    ld.add_action(backoff_cooldown_sec_cmd)
++    ld.add_action(local_update_range_x_cmd)
++    ld.add_action(local_update_range_y_cmd)
++    ld.add_action(local_update_range_z_cmd)
++    ld.add_action(thresh_replan_time_cmd)
++    ld.add_action(thresh_no_replan_meter_cmd)
+     ld.add_action(use_dynamic_cmd)
+ 
+     # Add nodes and includes
+diff --git a/src/planner/plan_manage/launch/single_run_in_sim.launch.py b/src/planner/plan_manage/launch/single_run_in_sim.launch.py
+index 2e29d63..b80804c 100755
+--- a/src/planner/plan_manage/launch/single_run_in_sim.launch.py
++++ b/src/planner/plan_manage/launch/single_run_in_sim.launch.py
+@@ -14,10 +14,43 @@ def generate_launch_description():
+     obj_num = LaunchConfiguration('obj_num', default=10)
+     drone_id = LaunchConfiguration('drone_id', default=0)
+     
+-    map_size_x = LaunchConfiguration('map_size_x', default = 50.0)
+-    map_size_y = LaunchConfiguration('map_size_y', default = 25.0)
+-    map_size_z = LaunchConfiguration('map_size_z', default = 2.0)
+-    odom_topic = LaunchConfiguration('odom_topic', default = 'visual_slam/odom')
++    map_size_x = LaunchConfiguration('map_size_x', default = 100.0)
++    map_size_y = LaunchConfiguration('map_size_y', default = 50.0)
++    map_size_z = LaunchConfiguration('map_size_z', default = 10.0)
++    odom_topic = LaunchConfiguration('odom_topic', default = '/odometry')
++    use_sim_time = LaunchConfiguration('use_sim_time', default='false')
++    camera_pose_topic = LaunchConfiguration('camera_pose_topic', default='nouse1')
++    depth_topic = LaunchConfiguration('depth_topic', default='nouse2')
++    cloud_topic = LaunchConfiguration('cloud_topic', default='/points')
++    grid_occ_topic = LaunchConfiguration('grid_occ_topic', default='grid/grid_map/occupancy_inflate')
++    grid_pose_type = LaunchConfiguration('grid_pose_type', default=2)
++    grid_frame_id = LaunchConfiguration('grid_frame_id', default='map')
++    grid_obstacles_inflation = LaunchConfiguration('grid_obstacles_inflation', default=0.40)
++    grid_min_ray_length = LaunchConfiguration('grid_min_ray_length', default=0.20)
++    grid_resolution = LaunchConfiguration('grid_resolution', default=0.15)
++    sector_filter_enable = LaunchConfiguration('sector_filter_enable', default='false')
++    sector_min_angle_deg = LaunchConfiguration('sector_min_angle_deg', default=-60.0)
++    sector_max_angle_deg = LaunchConfiguration('sector_max_angle_deg', default=60.0)
++    sector_use_stride = LaunchConfiguration('sector_use_stride', default='false')
++    sector_stride = LaunchConfiguration('sector_stride', default=1)
++    sector_use_voxel = LaunchConfiguration('sector_use_voxel', default='false')
++    sector_voxel_leaf = LaunchConfiguration('sector_voxel_leaf', default=0.10)
++    sector_adaptive_recovery = LaunchConfiguration('sector_adaptive_recovery', default='true')
++    sector_auto_disable_on_front_block = LaunchConfiguration('sector_auto_disable_on_front_block', default='false')
++    sector_full_view_hold_sec = LaunchConfiguration('sector_full_view_hold_sec', default=2.0)
++    virtual_ceil_height = LaunchConfiguration('virtual_ceil_height', default=-0.1)
++    z_max = LaunchConfiguration('z_max', default=2.0)
++    z_fixed = LaunchConfiguration('z_fixed', default=-1.0)
++    optimization_dist0            = LaunchConfiguration('optimization_dist0',            default=0.32)
++    optimization_lambda_collision  = LaunchConfiguration('optimization_lambda_collision',  default=2.0)
++    optimization_lambda_smooth     = LaunchConfiguration('optimization_lambda_smooth',     default=1.0)
++    optimization_lambda_feasibility= LaunchConfiguration('optimization_lambda_feasibility',default=0.1)
++    planning_horizon      = LaunchConfiguration('planning_horizon',        default=7.5)
++    local_update_range_x  = LaunchConfiguration('local_update_range_x',   default=8.0)
++    local_update_range_y  = LaunchConfiguration('local_update_range_y',   default=8.0)
++    local_update_range_z  = LaunchConfiguration('local_update_range_z',   default=4.5)
++    thresh_replan_time    = LaunchConfiguration('thresh_replan_time',     default=1.0)
++    thresh_no_replan_meter= LaunchConfiguration('thresh_no_replan_meter', default=1.0)
+     
+     
+     # 声明全局参数
+@@ -28,7 +61,128 @@ def generate_launch_description():
+     map_size_y_cmd = DeclareLaunchArgument('map_size_y', default_value=map_size_y, description='Map size along y')
+     map_size_z_cmd = DeclareLaunchArgument('map_size_z', default_value=map_size_z, description='Map size along z')
+     odom_topic_cmd = DeclareLaunchArgument('odom_topic', default_value=odom_topic, description='Odometry topic')
+-
++    use_sim_time_cmd = DeclareLaunchArgument('use_sim_time', default_value=use_sim_time, description='Use simulation time')
++    camera_pose_topic_cmd = DeclareLaunchArgument(
++        'camera_pose_topic', default_value=camera_pose_topic, description='Camera pose topic'
++    )
++    depth_topic_cmd = DeclareLaunchArgument(
++        'depth_topic', default_value=depth_topic, description='Depth image topic'
++    )
++    cloud_topic_cmd = DeclareLaunchArgument(
++        'cloud_topic', default_value=cloud_topic, description='Point cloud topic'
++    )
++    grid_occ_topic_cmd = DeclareLaunchArgument(
++        'grid_occ_topic', default_value=grid_occ_topic, description='Grid map visualize topic'
++    )
++    grid_pose_type_cmd = DeclareLaunchArgument(
++        'grid_pose_type', default_value=grid_pose_type, description='grid_map pose type: 1=pose,2=odom'
++    )
++    grid_frame_id_cmd = DeclareLaunchArgument(
++        'grid_frame_id', default_value=grid_frame_id, description='grid_map target frame id'
++    )
++    grid_obstacles_inflation_cmd = DeclareLaunchArgument(
++        'grid_obstacles_inflation', default_value=grid_obstacles_inflation,
++        description='Grid map obstacle inflation radius'
++    )
++    grid_min_ray_length_cmd = DeclareLaunchArgument(
++        'grid_min_ray_length', default_value=grid_min_ray_length,
++        description='Grid map minimum ray length'
++    )
++    grid_resolution_cmd = DeclareLaunchArgument(
++        'grid_resolution', default_value=grid_resolution, description='Grid map voxel resolution'
++    )
++    sector_filter_enable_cmd = DeclareLaunchArgument(
++        'sector_filter_enable', default_value=sector_filter_enable,
++        description='Enable embedded sector filter inside ego_planner_node'
++    )
++    sector_min_angle_deg_cmd = DeclareLaunchArgument(
++        'sector_min_angle_deg', default_value=sector_min_angle_deg,
++        description='Embedded sector filter min angle in degree'
++    )
++    sector_max_angle_deg_cmd = DeclareLaunchArgument(
++        'sector_max_angle_deg', default_value=sector_max_angle_deg,
++        description='Embedded sector filter max angle in degree'
++    )
++    sector_use_stride_cmd = DeclareLaunchArgument(
++        'sector_use_stride', default_value=sector_use_stride,
++        description='Embedded sector filter stride sampling on/off'
++    )
++    sector_stride_cmd = DeclareLaunchArgument(
++        'sector_stride', default_value=sector_stride,
++        description='Embedded sector filter stride value'
++    )
++    sector_use_voxel_cmd = DeclareLaunchArgument(
++        'sector_use_voxel', default_value=sector_use_voxel,
++        description='Embedded sector filter voxel downsample on/off'
++    )
++    sector_voxel_leaf_cmd = DeclareLaunchArgument(
++        'sector_voxel_leaf', default_value=sector_voxel_leaf,
++        description='Embedded sector filter voxel leaf size'
++    )
++    sector_adaptive_recovery_cmd = DeclareLaunchArgument(
++        'sector_adaptive_recovery', default_value=sector_adaptive_recovery,
++        description='Embedded sector filter adaptive full-view recovery on/off'
++    )
++    sector_auto_disable_on_front_block_cmd = DeclareLaunchArgument(
++        'sector_auto_disable_on_front_block', default_value=sector_auto_disable_on_front_block,
++        description='Trigger full-view when front is blocked by obstacles'
++    )
++    sector_full_view_hold_sec_cmd = DeclareLaunchArgument(
++        'sector_full_view_hold_sec', default_value=sector_full_view_hold_sec,
++        description='How long (sec) to hold full-view after recovery trigger'
++    )
++    virtual_ceil_height_cmd = DeclareLaunchArgument(
++        'virtual_ceil_height', default_value=virtual_ceil_height,
++        description='Virtual ceiling height [m] (set -0.1 to disable)'
++    )
++    z_max_cmd = DeclareLaunchArgument(
++        'z_max', default_value=z_max,
++        description='Max flight altitude [m] applied at FSM and traj_server (set -1 to disable)'
++    )
++    z_fixed_cmd = DeclareLaunchArgument(
++        'z_fixed', default_value=z_fixed,
++        description='Fix traj_server Z output to this value [m] (set -1 to disable)'
++    )
++    optimization_dist0_cmd = DeclareLaunchArgument(
++        'optimization_dist0', default_value=optimization_dist0,
++        description='Optimizer clearance distance'
++    )
++    optimization_lambda_collision_cmd = DeclareLaunchArgument(
++        'optimization_lambda_collision', default_value=optimization_lambda_collision,
++        description='Collision avoidance cost weight'
++    )
++    optimization_lambda_smooth_cmd = DeclareLaunchArgument(
++        'optimization_lambda_smooth', default_value=optimization_lambda_smooth,
++        description='Smoothness cost weight'
++    )
++    optimization_lambda_feasibility_cmd = DeclareLaunchArgument(
++        'optimization_lambda_feasibility', default_value=optimization_lambda_feasibility,
++        description='Feasibility cost weight'
++    )
++    planning_horizon_cmd = DeclareLaunchArgument(
++        'planning_horizon', default_value=planning_horizon,
++        description='FSM/manager planning horizon [m]'
++    )
++    local_update_range_x_cmd = DeclareLaunchArgument(
++        'local_update_range_x', default_value=local_update_range_x,
++        description='Grid map local update range in X [m]'
++    )
++    local_update_range_y_cmd = DeclareLaunchArgument(
++        'local_update_range_y', default_value=local_update_range_y,
++        description='Grid map local update range in Y [m]'
++    )
++    local_update_range_z_cmd = DeclareLaunchArgument(
++        'local_update_range_z', default_value=local_update_range_z,
++        description='Grid map local update range in Z [m]'
++    )
++    thresh_replan_time_cmd = DeclareLaunchArgument(
++        'thresh_replan_time', default_value=thresh_replan_time,
++        description='FSM replan time threshold [s]'
++    )
++    thresh_no_replan_meter_cmd = DeclareLaunchArgument(
++        'thresh_no_replan_meter', default_value=thresh_no_replan_meter,
++        description='FSM no-replan distance threshold [m]'
++    )
+     # 地图属性以及是否使用动力学仿真
+     use_mockamap = LaunchConfiguration('use_mockamap', default=False) # map_generator or mockamap 
+     
+@@ -37,59 +191,6 @@ def generate_launch_description():
+     use_dynamic = LaunchConfiguration('use_dynamic', default=False)  
+     use_dynamic_cmd = DeclareLaunchArgument('use_dynamic', default_value=use_dynamic, description='Use Drone Simulation Considering Dynamics or Not')
+     
+-    # map
+-    map_generator_node = Node(
+-        package='map_generator',
+-        executable='random_forest',
+-        name='random_forest',
+-        output='screen',
+-        parameters=[
+-            {'map/x_size': 26.0},
+-            {'map/y_size': 20.0},
+-            {'map/z_size': 3.0},
+-            {'map/resolution': 0.1},
+-            {'ObstacleShape/seed': 1.0},
+-            {'map/obs_num': 250},
+-            {'ObstacleShape/lower_rad': 0.5},
+-            {'ObstacleShape/upper_rad': 0.7},
+-            {'ObstacleShape/lower_hei': 0.0},
+-            {'ObstacleShape/upper_hei': 3.0},
+-            {'map/circle_num': 250},
+-            {'ObstacleShape/radius_l': 0.7},
+-            {'ObstacleShape/radius_h': 0.5},
+-            {'ObstacleShape/z_l': 0.7},
+-            {'ObstacleShape/z_h': 0.8},
+-            {'ObstacleShape/theta': 0.5},
+-            {'pub_rate': 1.0},
+-            {'min_distance': 0.8}
+-        ],
+-        condition = UnlessCondition(use_mockamap)
+-    )
+-
+-    mockamap_node = Node(
+-        package='mockamap',
+-        executable='mockamap_node',
+-        name='mockamap_node',
+-        output='screen',
+-        remappings=[
+-            ('/mock_map', '/map_generator/global_cloud')
+-        ],
+-        parameters=[
+-            {'seed': 127},
+-            {'update_freq': 0.5},
+-            {'resolution': 0.1},
+-            {'x_length': PythonExpression(['int(', map_size_x, ')'])},
+-            {'y_length': PythonExpression(['int(', map_size_y, ')'])},
+-            {'z_length': PythonExpression(['int(', map_size_z, ')'])},
+-            {'type': 1},
+-            {'complexity': 0.05},
+-            {'fill': 0.12},
+-            {'fractal': 1},
+-            {'attenuation': 0.1}
+-        ],
+-        condition = IfCondition(use_mockamap)
+-    )
+-    
+     # Include advanced parameters
+     advanced_param_include = IncludeLaunchDescription(
+         PythonLaunchDescriptionSource(os.path.join(
+@@ -100,21 +201,48 @@ def generate_launch_description():
+             'map_size_y_': map_size_y,
+             'map_size_z_': map_size_z,
+             'odometry_topic': odom_topic,
++            'use_sim_time': use_sim_time,
+             'obj_num_set': obj_num,
+             
+-            'camera_pose_topic': 'pcl_render_node/camera_pose',
+-            'depth_topic': 'pcl_render_node/depth',
+-            'cloud_topic': 'pcl_render_node/cloud',
+-            
+-            'cx': str(321.04638671875),
+-            'cy': str(243.44969177246094),
+-            'fx': str(387.229248046875),
+-            'fy': str(387.229248046875),
+-            'max_vel': str(2.0),
+-            'max_acc': str(6.0),
+-            'planning_horizon': str(7.5),
+-            'use_distinctive_trajs': 'True',
+-            'flight_type': str(2),
++            'camera_pose_topic': camera_pose_topic,
++            'depth_topic': depth_topic,
++            'cloud_topic': cloud_topic,
++            'grid_occ_topic': grid_occ_topic,
++            'grid_pose_type': grid_pose_type,
++            'grid_frame_id': grid_frame_id,
++            'grid_obstacles_inflation': grid_obstacles_inflation,
++            'grid_min_ray_length': grid_min_ray_length,
++            'grid_resolution': grid_resolution,
++            'sector_filter_enable': sector_filter_enable,
++            'sector_min_angle_deg': sector_min_angle_deg,
++            'sector_max_angle_deg': sector_max_angle_deg,
++            'sector_use_stride': sector_use_stride,
++            'sector_stride': sector_stride,
++            'sector_use_voxel': sector_use_voxel,
++            'sector_voxel_leaf': sector_voxel_leaf,
++            'sector_adaptive_recovery': sector_adaptive_recovery,
++            'sector_auto_disable_on_front_block': sector_auto_disable_on_front_block,
++            'sector_full_view_hold_sec': sector_full_view_hold_sec,
++            'virtual_ceil_height': virtual_ceil_height,
++            'z_max': z_max,
++            'optimization_dist0': optimization_dist0,
++            'optimization_lambda_collision': optimization_lambda_collision,
++            'optimization_lambda_smooth': optimization_lambda_smooth,
++            'optimization_lambda_feasibility': optimization_lambda_feasibility,
++            'local_update_range_x': local_update_range_x,
++            'local_update_range_y': local_update_range_y,
++            'local_update_range_z': local_update_range_z,
++            'thresh_replan_time': thresh_replan_time,
++            'thresh_no_replan_meter': thresh_no_replan_meter,
++            'cx': str(428.8812561035156),
++            'cy': str(238.36671447753906),
++            'fx': str(428.8812561035156),
++            'fy': str(428.86175537109375),
++            'max_vel': str(1.5),
++            'max_acc': str(3.0),
++            'planning_horizon': planning_horizon,
++            'use_distinctive_trajs': 'False',
++            'flight_type': str(1),
+             'point_num': str(4),
+             'point0_x': str(15.0),
+             'point0_y': str(0.0),
+@@ -138,53 +266,83 @@ def generate_launch_description():
+         }.items()
+     )
+     
++    yaw_to_goal = LaunchConfiguration('yaw_to_goal', default='true')
++    yaw_to_goal_cmd = DeclareLaunchArgument(
++        'yaw_to_goal', default_value=yaw_to_goal,
++        description='Face final goal instead of path tangent for yaw'
++    )
++
+     # Trajectory server node
+     traj_server_node = Node(
+         package='ego_planner',
+         executable='traj_server',
+-        name=['drone_', drone_id, '_traj_server'],
++        name=['traj_server'],
++        respawn=True,
++        respawn_delay=2.0,
+         output='screen',
+         remappings=[
+-            ('position_cmd', ['drone_', drone_id, '_planning/pos_cmd']),
+-            ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
++            ('position_cmd', ['planning/pos_cmd']),
++            ('planning/bspline', ['planning/bspline'])
+         ],
+         parameters=[
+-            {'traj_server/time_forward': 1.0}
++            {'use_sim_time': use_sim_time},
++            {'traj_server/time_forward': 1.0},
++            {'traj_server/yaw_to_goal': yaw_to_goal},
++            {'traj_server/z_max': z_max},
++            {'traj_server/z_fixed': z_fixed}
+         ]
+     )
+     
+-    # Include simulator 
+-    simulator_include = IncludeLaunchDescription(PythonLaunchDescriptionSource(
+-        os.path.join(get_package_share_directory('ego_planner'), 'launch', 'simulator.launch.py')),
+-        launch_arguments={
+-            'use_dynamic': use_dynamic,
+-            'drone_id': drone_id,
+-            'map_size_x_': map_size_x,
+-            'map_size_y_': map_size_y,
+-            'map_size_z_': map_size_z,
+-            'init_x_': str(-15.0),
+-            'init_y_': str(0.0),
+-            'init_z_': str(0.1),
+-            'odometry_topic': odom_topic
+-        }.items()
+-    )
+-    
+     ld = LaunchDescription()
+         
+     ld.add_action(map_size_x_cmd)
+     ld.add_action(map_size_y_cmd)
+     ld.add_action(map_size_z_cmd)
+     ld.add_action(odom_topic_cmd)
++    ld.add_action(use_sim_time_cmd)
++    ld.add_action(camera_pose_topic_cmd)
++    ld.add_action(depth_topic_cmd)
++    ld.add_action(cloud_topic_cmd)
++    ld.add_action(grid_occ_topic_cmd)
++    ld.add_action(grid_pose_type_cmd)
++    ld.add_action(grid_frame_id_cmd)
++    ld.add_action(grid_obstacles_inflation_cmd)
++    ld.add_action(grid_min_ray_length_cmd)
++    ld.add_action(grid_resolution_cmd)
++    ld.add_action(sector_filter_enable_cmd)
++    ld.add_action(sector_min_angle_deg_cmd)
++    ld.add_action(sector_max_angle_deg_cmd)
++    ld.add_action(sector_use_stride_cmd)
++    ld.add_action(sector_stride_cmd)
++    ld.add_action(sector_use_voxel_cmd)
++    ld.add_action(sector_voxel_leaf_cmd)
++    ld.add_action(sector_adaptive_recovery_cmd)
++    ld.add_action(sector_auto_disable_on_front_block_cmd)
++    ld.add_action(sector_full_view_hold_sec_cmd)
++    ld.add_action(virtual_ceil_height_cmd)
++    ld.add_action(z_max_cmd)
++    ld.add_action(z_fixed_cmd)
++    ld.add_action(optimization_dist0_cmd)
++    ld.add_action(optimization_lambda_collision_cmd)
++    ld.add_action(optimization_lambda_smooth_cmd)
++    ld.add_action(optimization_lambda_feasibility_cmd)
++    ld.add_action(planning_horizon_cmd)
++    ld.add_action(local_update_range_x_cmd)
++    ld.add_action(local_update_range_y_cmd)
++    ld.add_action(local_update_range_z_cmd)
++    ld.add_action(thresh_replan_time_cmd)
++    ld.add_action(thresh_no_replan_meter_cmd)
++    ld.add_action(yaw_to_goal_cmd)
+     ld.add_action(obj_num_cmd)
+     ld.add_action(drone_id_cmd)
+     ld.add_action(use_dynamic_cmd)
+-    ld.add_action(use_mockamap_cmd)
++    # ld.add_action(use_mockamap_cmd)
+ 
+     # 添加 Map Generator 节点
+-    ld.add_action(map_generator_node)
+-    ld.add_action(mockamap_node)
++    # ld.add_action(map_generator_node)
++    # ld.add_action(mockamap_node)
+     ld.add_action(advanced_param_include)
+     ld.add_action(traj_server_node)
+-    ld.add_action(simulator_include)
++    # ld.add_action(simulator_include)
+ 
+-    return ld
+\ No newline at end of file
++    return ld
+diff --git a/src/planner/plan_manage/package.xml b/src/planner/plan_manage/package.xml
+index c3a742f..62bd5ef 100755
+--- a/src/planner/plan_manage/package.xml
++++ b/src/planner/plan_manage/package.xml
+@@ -12,6 +12,7 @@
+   <depend>rclcpp</depend>
+   <depend>ament_cmake</depend>
+   <depend>geometry_msgs</depend>
++  <depend>std_msgs</depend>
+   <depend>quadrotor_msgs</depend>
+   <depend>visualization_msgs</depend>
+   <depend>nav_msgs</depend>
+diff --git a/src/planner/plan_manage/src/ego_planner_node.cpp b/src/planner/plan_manage/src/ego_planner_node.cpp
+index 89ec9a5..cb1c0a2 100755
+--- a/src/planner/plan_manage/src/ego_planner_node.cpp
++++ b/src/planner/plan_manage/src/ego_planner_node.cpp
+@@ -1,6 +1,7 @@
+ #include <rclcpp/rclcpp.hpp>
+ #include <visualization_msgs/msg/marker.hpp>
+ #include <iostream>
++#include <chrono>
+ 
+ #include <ego_planner/ego_replan_fsm.h>
+ 
+@@ -12,12 +13,25 @@ int main(int argc, char **argv)
+   auto node = std::make_shared<rclcpp::Node>("ego_planner_node");
+ 
+   EGOReplanFSM rebo_replan;
+-
+-  rebo_replan.init(node);
++  try
++  {
++    rebo_replan.init(node);
++  }
++  catch (const std::exception &e)
++  {
++    RCLCPP_FATAL(node->get_logger(), "Failed to initialize ego planner FSM: %s", e.what());
++    rclcpp::shutdown();
++    return 1;
++  }
++  catch (...)
++  {
++    RCLCPP_FATAL(node->get_logger(), "Failed to initialize ego planner FSM: unknown exception");
++    rclcpp::shutdown();
++    return 1;
++  }
+ 
+   rclcpp::spin(node);
+   rclcpp::shutdown();
+-
+   return 0;
+ }
+ 
+@@ -53,4 +67,4 @@ int main(int argc, char **argv)
+ //   ros::waitForShutdown();
+ 
+ //   return 0;
+-// }
+\ No newline at end of file
++// }
+diff --git a/src/planner/plan_manage/src/ego_replan_fsm.cpp b/src/planner/plan_manage/src/ego_replan_fsm.cpp
+index 78d5eee..addf128 100755
+--- a/src/planner/plan_manage/src/ego_replan_fsm.cpp
++++ b/src/planner/plan_manage/src/ego_replan_fsm.cpp
+@@ -13,6 +13,7 @@ namespace ego_planner
+     have_target_ = false;
+     have_odom_ = false;
+     have_recv_pre_agent_ = false;
++    end_pt_ = Eigen::Vector3d(1e6, 1e6, 1e6);  // ensure first goal always triggers full view
+ 
+     node_->declare_parameter("fsm/flight_type", -1);
+     node_->declare_parameter("fsm/thresh_replan_time", -1.0);
+@@ -22,6 +23,7 @@ namespace ego_planner
+     node_->declare_parameter("fsm/emergency_time", 1.0);
+     node_->declare_parameter("fsm/realworld_experiment", false);
+     node_->declare_parameter("fsm/fail_safe", true);
++    node_->declare_parameter("fsm/z_max", 2.0);
+ 
+     node_->get_parameter("fsm/flight_type", target_type_);
+     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
+@@ -31,6 +33,7 @@ namespace ego_planner
+     node_->get_parameter("fsm/emergency_time", emergency_time_);
+     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
+     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
++    node_->get_parameter("fsm/z_max", z_max_);
+ 
+     have_trigger_ = !flag_realworld_experiment_;
+ 
+@@ -111,6 +114,7 @@ namespace ego_planner
+ 
+     bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/bspline", 10);
+     data_disp_pub_ = node_->create_publisher<traj_utils::msg::DataDisp>("planning/data_display", 100);
++    replan_status_pub_ = node_->create_publisher<std_msgs::msg::Bool>("planning/replan_success", 10);
+ 
+     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
+     {
+@@ -133,18 +137,12 @@ namespace ego_planner
+           });
+ 
+       RCLCPP_INFO(node_->get_logger(), "Wait for 1 second.");
+-      int count = 0;
+-      while (rclcpp::ok() && count++ < 1000)
+-      {
+-        rclcpp::spin_some(node_);
+-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-      }
++      std::this_thread::sleep_for(std::chrono::seconds(1));
+ 
+       RCLCPP_WARN(node_->get_logger(), "Waiting for trigger from [n3ctrl] from RC");
+ 
+       while (rclcpp::ok() && (!have_odom_ || !have_trigger_))
+       {
+-        rclcpp::spin_some(node_);
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       }
+ 
+@@ -209,12 +207,10 @@ namespace ego_planner
+         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
+       else
+       {
+-        while (exec_state_ != EXEC_TRAJ)
+-        {
+-          rclcpp::spin_some(node_);
+-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-        }
+-        changeFSMExecState(REPLAN_TRAJ, "TRIG");
++        // GEN_NEW_TRAJ 중 재트리거: planning 완료 후 자동으로 EXEC_TRAJ 전환되므로
++        // 여기서 blocking wait 불필요 → REPLAN으로 즉시 전환
++        if (exec_state_ == EXEC_TRAJ)
++          changeFSMExecState(REPLAN_TRAJ, "TRIG");
+       }
+ 
+       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
+@@ -241,8 +237,14 @@ namespace ego_planner
+ 
+     init_pt_ = odom_pos_;
+ 
+-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, 1.0);
++    double goal_z = std::min(msg->pose.position.z > 0.1 ? msg->pose.position.z : 1.0, z_max_);
++    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, goal_z);
+ 
++    // Only arm full view for genuinely new goals, not for periodic republishes of the same goal
++    const bool is_new_goal = (end_wp - end_pt_).norm() > 0.3;
++    if (is_new_goal) {
++      planner_manager_->grid_map_->armFullViewRecovery("new waypoint received");
++    }
+     planNextWaypoint(end_wp);
+   }
+ 
+@@ -532,6 +534,11 @@ namespace ego_planner
+     {
+ 
+       bool success = planFromGlobalTraj(10); // zx-todo
++      {
++        std_msgs::msg::Bool msg;
++        msg.data = success;
++        replan_status_pub_->publish(msg);
++      }
+       if (success)
+       {
+         changeFSMExecState(EXEC_TRAJ, "FSM");
+@@ -548,7 +555,13 @@ namespace ego_planner
+     case REPLAN_TRAJ:
+     {
+ 
+-      if (planFromCurrentTraj(1))
++      bool replan_ok = planFromCurrentTraj(1);
++      {
++        std_msgs::msg::Bool msg;
++        msg.data = replan_ok;
++        replan_status_pub_->publish(msg);
++      }
++      if (replan_ok)
+       {
+         changeFSMExecState(EXEC_TRAJ, "FSM");
+         publishSwarmTrajs(false);
+@@ -577,6 +590,8 @@ namespace ego_planner
+           (end_pt_ - pos).norm() < no_replan_thresh_)
+       {
+         wp_id_++;
++        // Full view scan before planning next leg so side obstacles are visible
++        planner_manager_->grid_map_->armFullViewRecovery("waypoint reached");
+         planNextWaypoint(wps_[wp_id_]);
+       }
+       else if ((local_target_pt_ - end_pt_).norm() < 1e-3) // close to the global target
+diff --git a/src/planner/plan_manage/src/traj_server.cpp b/src/planner/plan_manage/src/traj_server.cpp
+index a32026d..3d00e6d 100755
+--- a/src/planner/plan_manage/src/traj_server.cpp
++++ b/src/planner/plan_manage/src/traj_server.cpp
+@@ -23,6 +23,9 @@ int traj_id_;
+ // yaw control
+ double last_yaw_, last_yaw_dot_;
+ double time_forward_;
++bool yaw_to_goal_;
++double z_max_;
++double z_fixed_;
+ 
+ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
+ {
+@@ -77,7 +80,11 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
+   double yaw = 0;
+   double yawdot = 0;
+ 
+-  Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
++  Eigen::Vector3d dir;
++  if (yaw_to_goal_)
++    dir = traj_[0].evaluateDeBoorT(traj_duration_) - pos;
++  else
++    dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
+   double yaw_temp = dir.norm() > 0.1 ? atan2(dir(1), dir(0)) : last_yaw_;
+   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
+   if (yaw_temp - last_yaw_ > PI)
+@@ -213,7 +220,7 @@ void cmdCallback()
+ 
+   cmd.position.x = pos(0);
+   cmd.position.y = pos(1);
+-  cmd.position.z = pos(2);
++  cmd.position.z = (z_fixed_ > 0.0) ? z_fixed_ : ((z_max_ > 0.0) ? std::min(pos(2), z_max_) : pos(2));
+ 
+   cmd.velocity.x = vel(0);
+   cmd.velocity.y = vel(1);
+@@ -261,6 +268,15 @@ int main(int argc, char **argv)
+   node->declare_parameter("traj_server/time_forward", -1.0);
+   node->get_parameter("traj_server/time_forward", time_forward_);
+ 
++  node->declare_parameter("traj_server/yaw_to_goal", false);
++  node->get_parameter("traj_server/yaw_to_goal", yaw_to_goal_);
++
++  node->declare_parameter("traj_server/z_max", -1.0);
++  node->get_parameter("traj_server/z_max", z_max_);
++
++  node->declare_parameter("traj_server/z_fixed", -1.0);
++  node->get_parameter("traj_server/z_fixed", z_fixed_);
++
+   last_yaw_ = 0.0;
+   last_yaw_dot_ = 0.0;
+ 
