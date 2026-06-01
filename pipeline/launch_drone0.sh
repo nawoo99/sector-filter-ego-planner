@@ -151,7 +151,15 @@ show_status() {
 cleanup_processes() {
     echo "  Cleaning up residual processes..."
 
-    pkill -f "MicroXRCEAgent" 2>/dev/null && echo "  [x] MicroXRCEAgent killed"
+    # MicroXRCEAgent는 pkill -f가 종종 실패하므로 직접 PID kill
+    for pid in $(pgrep -f "MicroXRCEAgent" 2>/dev/null); do
+        [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] && kill -9 "$pid" 2>/dev/null
+    done
+    # 포트 8888을 누가 잡고 있으면 그것도 죽이기
+    for pid in $(ss -tulnp 2>/dev/null | grep ":8888" | grep -oP 'pid=\K[0-9]+'); do
+        [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] && kill -9 "$pid" 2>/dev/null
+    done
+    echo "  [x] MicroXRCEAgent killed"
 
     pkill -f "px4_sitl_default/bin/px4" 2>/dev/null
     pkill -f "make px4_sitl" 2>/dev/null
@@ -167,20 +175,55 @@ cleanup_processes() {
     }
     echo "  [x] Gazebo processes killed"
 
-    pkill -f "velodyne_3d_lidar_simulation" 2>/dev/null
-    pkill -f "ego_planner" 2>/dev/null
-    pkill -f "traj_server" 2>/dev/null
-    pkill -f "parameter_bridge" 2>/dev/null
-    pkill -f "static_transform_publisher" 2>/dev/null
-    pkill -f "px4_odometry_remap" 2>/dev/null
-    pkill -f "pose_to_aligned" 2>/dev/null
-    pkill -f "safe_manual_goal_benchmark" 2>/dev/null
-    pkill -f "goal_batch_runner" 2>/dev/null
+    # pkill -f가 일부 프로세스를 못 잡는 경우가 있어 pgrep 후 직접 kill -9 사용
+    local kill_patterns=(
+        "velodyne_3d_lidar_simulation"
+        "ego_planner"
+        "traj_server"
+        "rviz2"
+        "parameter_bridge"
+        "static_transform_publisher"
+        "px4_odometry_remap"
+        "pose_to_aligned"
+        "safe_manual_goal_benchmark"
+        "goal_batch_runner"
+        "keyboard.py"
+        "offboard.py"
+    )
+    for pat in "${kill_patterns[@]}"; do
+        for pid in $(pgrep -f "$pat" 2>/dev/null); do
+            # 자기 자신(cleanup 호출한 셸/스크립트)은 제외
+            if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ]; then
+                kill -9 "$pid" 2>/dev/null
+            fi
+        done
+    done
     # benchmark의 python3 - (stdin heredoc) 프로세스 종료 (ros2 daemon 제외)
     pgrep -a python3 2>/dev/null | grep -v "ros2cli\|vscode\|jedi" | grep " -$" | awk '{print $1}' | xargs -r kill -9 2>/dev/null
-    pkill -f "keyboard.py" 2>/dev/null
-    pkill -f "offboard.py" 2>/dev/null
     echo "  [x] ROS2 nodes killed"
+
+    # ros2 launch가 /tmp에 남기는 launch_params_* 누적 파일 정리
+    # 누적되면 Qt/RViz 시작이 느려지거나 실패함
+    local count
+    count=$(find /tmp -maxdepth 1 -name "launch_params_*" 2>/dev/null | wc -l)
+    if [ "$count" -gt 100 ]; then
+        find /tmp -maxdepth 1 -name "launch_params_*" -delete 2>/dev/null
+        echo "  [x] launch_params 임시파일 $count 개 정리"
+    fi
+
+    # RViz persistent_settings에 깨진 경로 있으면 RViz가 hang 함
+    # Recent Configs에 존재하지 않는 파일이 있는지 확인하고 있으면 삭제
+    if [ -f /root/.rviz2/persistent_settings ]; then
+        local broken=0
+        while IFS= read -r path; do
+            path=$(echo "$path" | sed 's/^[[:space:]]*-[[:space:]]*//')
+            [ -n "$path" ] && [ ! -f "$path" ] && broken=1
+        done < <(grep "^  - " /root/.rviz2/persistent_settings 2>/dev/null)
+        if [ "$broken" = "1" ]; then
+            rm -f /root/.rviz2/persistent_settings
+            echo "  [x] .rviz2/persistent_settings 깨진 경로 → 삭제"
+        fi
+    fi
 
     sleep 2
 
@@ -188,7 +231,7 @@ cleanup_processes() {
     remaining=$(pgrep -f "px4_sitl_default|gz sim|gzserver|ego_planner|MicroXRCEAgent" 2>/dev/null | wc -l)
     if [ "$remaining" -gt 0 ]; then
         echo "  [!] $remaining processes still alive, sending SIGKILL..."
-        pkill -9 -f "px4_sitl_default|MicroXRCEAgent|gz sim|gzserver|ego_planner|traj_server|velodyne_3d_lidar_simulation|safe_manual_goal_benchmark|goal_batch_runner|keyboard.py|offboard.py" 2>/dev/null
+        pkill -9 -f "px4_sitl_default|MicroXRCEAgent|gz sim|gzserver|ego_planner|traj_server|velodyne_3d_lidar_simulation|rviz2|safe_manual_goal_benchmark|goal_batch_runner|keyboard.py|offboard.py" 2>/dev/null
         sleep 1
     fi
 
@@ -310,10 +353,10 @@ tmux new-window -t "$SESSION" -n "agent"
 tmux send-keys -t "$SESSION:agent" "${PROC_CMD[1]}" Enter
 sleep "$DELAY_BETWEEN"
 
-echo "[2/$PROC_COUNT] uav starting..."
+echo "[2/$PROC_COUNT] uav starting (Gazebo world load 대기 25초)..."
 tmux new-window -t "$SESSION" -n "uav"
 tmux send-keys -t "$SESSION:uav" "${PROC_CMD[2]}" Enter
-sleep "$DELAY_BETWEEN"
+sleep 25
 
 echo "[3/$PROC_COUNT] lidar starting..."
 tmux new-window -t "$SESSION" -n "lidar"
@@ -340,17 +383,33 @@ tmux new-window -t "$SESSION" -n "offboard"
 tmux send-keys -t "$SESSION:offboard" "${PROC_CMD[7]}" Enter
 sleep 7
 
-echo "  [*] keyboard: switching to offboard mode (o) - attempt 1..."
-tmux send-keys -t "$SESSION:keyboard" "o" Enter
-sleep 3
-
-echo "  [*] keyboard: switching to offboard mode (o) - attempt 2..."
+echo "  [*] keyboard: switching to offboard mode (o)..."
 tmux send-keys -t "$SESSION:keyboard" "o" Enter
 sleep 4
 
 echo "  [*] keyboard: arming (t)..."
 tmux send-keys -t "$SESSION:keyboard" "t" Enter
-sleep 15
+
+# arming 검증: 첫 체크 10초 대기, 이후 5초 단위 재시도 (최대 3회)
+echo "  [*] arming 검증 대기 10초..."
+sleep 10
+ARM_OK=0
+for attempt in 1 2 3; do
+    z=$(timeout 2 ros2 topic echo --once /odometry 2>/dev/null \
+        | awk '/^      z:/{print $2; exit}')
+    is_up=$(awk -v z="${z:-0}" 'BEGIN{print (z+0 > 0.3) ? 1 : 0}')
+    if [ "$is_up" = "1" ]; then
+        echo "  [✓] arming OK (z=${z}m, attempt=${attempt})"
+        ARM_OK=1
+        break
+    fi
+    echo "  [!] 이륙 안됨 (z=${z:-NA}m) → o + 2초 + t 재시도 ${attempt}"
+    tmux send-keys -t "$SESSION:keyboard" "o" Enter
+    sleep 2
+    tmux send-keys -t "$SESSION:keyboard" "t" Enter
+    sleep 5
+done
+[ "$ARM_OK" = "0" ] && echo "  [!] arming 최종 실패. 수동 확인 필요"
 
 echo "[8/$PROC_COUNT] bench starting..."
 tmux new-window -t "$SESSION" -n "bench"
